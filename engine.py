@@ -1,10 +1,14 @@
 import streamlit as st
 import random
-from utils import compute_team_strength, get_win_probability, CONFERENCE
+from utils import (
+    compute_team_strength, get_win_probability, CONFERENCE,
+    stamina_drain_per_quarter, stamina_performance_modifier,
+)
 
 
 def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id, rested_players,
-                  opponent_team_id=None):
+                  opponent_team_id=None, difficulty='Easy'):
+    hard = difficulty == 'Hard'
     box_score = []
     total_score = 0
     injury_reports = []
@@ -18,30 +22,35 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
     opp_team_name = opp_team['full_name']
     opp_roster = all_stats[all_stats['TEAM_ID'] == opp_team['id']]
     opp_top5 = opp_roster.nlargest(5, 'PTS')
-    opp_bench = opp_roster[~opp_roster['PLAYER'].isin(opp_top5['PLAYER'])].nlargest(5, 'PTS')
+    opp_bench_df = opp_roster[~opp_roster['PLAYER'].isin(opp_top5['PLAYER'])].nlargest(5, 'PTS')
 
     opp_score = 0
     for _, opp_player in opp_top5.iterrows():
-        # Opponent players have randomised per-game stamina (fatigue varies across a season)
-        opp_stam = random.randint(55, 100)
+        # Hard: opponents play at near-full strength; Easy: wide variance favoring user
+        opp_stam = random.randint(85, 100) if hard else random.randint(55, 100)
         opp_pts = int(opp_player['PTS'] * random.uniform(0.8, 1.2) * (opp_stam / 100))
 
         # Opponent injury / foul-out — sub in bench player
         opp_inj_chance = 0.03 + ((100 - opp_stam) / 500)
-        if random.random() < opp_inj_chance and not opp_bench.empty:
+        if random.random() < opp_inj_chance and not opp_bench_df.empty:
             opp_pts = int(opp_pts * 0.2)
-            sub_row = opp_bench.iloc[0]
+            sub_row = opp_bench_df.iloc[0]
             sub_stam = random.randint(70, 100)
             opp_pts += int(sub_row['PTS'] * random.uniform(0.7, 1.0) * (sub_stam / 100) * 0.7)
             injury_reports.append(
                 f"🚨 {opp_player['PLAYER']} ({opp_team_name}) left the game!"
             )
-            opp_bench = opp_bench.iloc[1:]  # remove used sub
+            opp_bench_df = opp_bench_df.iloc[1:]  # remove used sub
 
         opp_score += opp_pts
 
-    # Bench / role-player contribution (rest of the rotation)
-    opp_bench_contribution = random.randint(30, 45)
+    # Bench contribution: Hard = scaled by actual bench quality; Easy = flat random
+    if hard:
+        opp_remaining = opp_roster[~opp_roster['PLAYER'].isin(opp_top5['PLAYER'])]
+        opp_bench_avg = opp_remaining['PTS'].mean() if not opp_remaining.empty else 5
+        opp_bench_contribution = int(opp_bench_avg * random.uniform(2.5, 4.0))
+    else:
+        opp_bench_contribution = random.randint(30, 45)
     opp_score += opp_bench_contribution
 
     starter_names = lineup_df['PLAYER'].tolist()
@@ -54,19 +63,30 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
     ].sort_values('PTS', ascending=False)
     bench_pool = bench_df.to_dict('records')
 
+    # Internal stamina — Hard mode reads carryover; Easy always 100
+    season_stam = st.session_state.get('season_stamina', {}) if hard else {}
+    game_stamina = {}
+    for name in starter_names:
+        game_stamina[name] = season_stam.get(name, 100)
+    for rec in bench_pool:
+        game_stamina[rec['PLAYER']] = season_stam.get(rec['PLAYER'], 100)
+
+    # Hard mode: trade chemistry penalty
+    chem_penalty = 0.95 if hard and st.session_state.get('trade_cooldown', 0) > 0 else 1.0
+
     for _, player in lineup_df.iterrows():
         name = player['PLAYER']
         pid = int(player['PLAYER_ID'])
-        current_stam = st.session_state.stamina.get(name, 100)
+        current_stam = game_stamina.get(name, 100)
 
         # Sub out if stamina critically low
         if current_stam < 30 and bench_pool:
             sub = bench_pool.pop(0)
             sub_name = sub['PLAYER']
-            sub_stam = st.session_state.stamina.get(sub_name, 100)
-            sub_pts = int(sub['PTS'] * random.uniform(0.7, 1.1) * (sub_stam / 100) * 0.7)
+            sub_stam = game_stamina.get(sub_name, 100)
+            sub_pts = int(sub['PTS'] * random.uniform(0.7, 1.1) * (sub_stam / 100) * 0.7 * chem_penalty)
             new_sub_stam = max(0, sub_stam - 10)
-            st.session_state.stamina[sub_name] = new_sub_stam
+            game_stamina[sub_name] = new_sub_stam
             total_score += sub_pts
             box_score.append({
                 "Player": f"↔ {sub_name} (sub for {name.split()[-1]})",
@@ -75,7 +95,6 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
                 "Stamina Left": new_sub_stam,
             })
             sub_reports.append(f"↔ {sub_name} subbed in for {name}")
-            # Starter sits — no further drain
             box_score.append({
                 "Player": name,
                 "PLAYER_ID": pid,
@@ -85,26 +104,38 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
             continue
 
         fatigue_multiplier = current_stam / 100
-        pts = int(player['PTS'] * random.uniform(0.8, 1.2) * fatigue_multiplier)
+        pts = int(player['PTS'] * random.uniform(0.8, 1.2) * fatigue_multiplier * chem_penalty)
 
-        # Tiered injury check
-        injury_chance = 0.03 + ((100 - current_stam) / 500)
+        # Tiered injury check — Hard: more frequent and severe
+        if hard:
+            injury_chance = 0.05 + ((100 - current_stam) / 350)
+        else:
+            injury_chance = 0.03 + ((100 - current_stam) / 500)
         if random.random() < injury_chance and name not in st.session_state.injured_list:
             pts = int(pts * 0.2)
             severity = random.random()
-            if severity < 0.6:
-                duration, tier = random.randint(1, 2), "MINOR"
-            elif severity < 0.9:
-                duration, tier = random.randint(3, 6), "MODERATE"
+            if hard:
+                # Harder injuries: minor < 0.35, moderate < 0.7, severe >= 0.7
+                if severity < 0.35:
+                    duration, tier = random.randint(1, 3), "MINOR"
+                elif severity < 0.70:
+                    duration, tier = random.randint(3, 8), "MODERATE"
+                else:
+                    duration, tier = random.randint(8, 20), "SEVERE"
             else:
-                duration, tier = random.randint(8, 15), "SEVERE"
+                if severity < 0.6:
+                    duration, tier = random.randint(1, 2), "MINOR"
+                elif severity < 0.9:
+                    duration, tier = random.randint(3, 6), "MODERATE"
+                else:
+                    duration, tier = random.randint(8, 15), "SEVERE"
             st.session_state.injured_list[name] = duration
             injury_reports.append(
                 f"🚨 {name} — {tier} injury, OUT {duration} game{'s' if duration > 1 else ''}!"
             )
 
         new_stam = max(0, current_stam - drain)
-        st.session_state.stamina[name] = new_stam
+        game_stamina[name] = new_stam
         total_score += pts
         box_score.append({
             "Player": name,
@@ -113,8 +144,15 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
             "Stamina Left": new_stam,
         })
 
-    # Bench / role-player contribution (rest of the rotation)
-    bench_contribution = random.randint(30, 45)
+    # Bench contribution: Hard = scaled by actual bench quality; Easy = flat
+    if hard:
+        user_bench_remaining = roster_df[
+            ~roster_df['PLAYER'].isin(starter_names + injured_names)
+        ]
+        user_bench_avg = user_bench_remaining['PTS'].mean() if not user_bench_remaining.empty else 5
+        bench_contribution = int(user_bench_avg * random.uniform(2.5, 4.0) * chem_penalty)
+    else:
+        bench_contribution = random.randint(30, 45)
     total_score += bench_contribution
     box_score.append({
         "Player": "Bench / Role Players",
@@ -123,26 +161,31 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
         "Stamina Left": 100,
     })
 
+    # Hard mode: record end-of-game stamina for carryover
+    if hard:
+        new_season_stam = dict(st.session_state.get('season_stamina', {}))
+        for name, stam in game_stamina.items():
+            # Starters recover partially; bench players who didn't play recover fully
+            if name in starter_names:
+                new_season_stam[name] = min(100, max(stam + 15, 70))
+            else:
+                new_season_stam[name] = min(100, new_season_stam.get(name, 100) + 25)
+        st.session_state.season_stamina = new_season_stam
+
     return total_score, opp_score, box_score, injury_reports, sub_reports, opp_team_name
 
 
 def post_game_updates(starter_names, rested_players, roster_df):
-    """Tick down injury counters and recover bench / rested player stamina."""
+    """Tick down injury and trade cooldown counters after a game."""
     # Decrement first, then remove fully-recovered players
     for p in list(st.session_state.injured_list.keys()):
         st.session_state.injured_list[p] -= 1
     healed = [p for p, g in st.session_state.injured_list.items() if g <= 0]
     for p in healed:
         del st.session_state.injured_list[p]
-
-    # Stamina recovery for non-starters
-    for _, player in roster_df.iterrows():
-        name = player['PLAYER']
-        if name in starter_names or name in st.session_state.injured_list:
-            continue
-        recovery = 40 if name in rested_players else 20
-        current = st.session_state.stamina.get(name, 100)
-        st.session_state.stamina[name] = min(100, current + recovery)
+    # Trade chemistry cooldown
+    if st.session_state.get('trade_cooldown', 0) > 0:
+        st.session_state.trade_cooldown -= 1
 
 
 def generate_next_opponent(my_team_id, all_teams):
@@ -197,15 +240,12 @@ def update_standings(standings, game_results):
             standings[team_id]['l'] += 1
 
 
-def auto_select_lineup(roster_df, injured_list, stamina):
-    """Pick best 5 healthy players by effective scoring for batch sim."""
+def auto_select_lineup(roster_df, injured_list):
+    """Pick best 5 healthy players by PTS for batch sim."""
     injured_names = list(injured_list.keys())
     healthy = roster_df[~roster_df['PLAYER'].isin(injured_names)].copy()
-    healthy['_eff'] = healthy['PTS'] * healthy['PLAYER'].map(
-        lambda n: stamina.get(n, 100) / 100
-    )
-    top5 = healthy.nlargest(5, '_eff')
-    return top5.drop(columns=['_eff']), []
+    top5 = healthy.nlargest(5, 'PTS')
+    return top5, []
 
 
 def simulate_playoff_series(team_a_id, team_b_id, all_stats):
@@ -264,3 +304,357 @@ def generate_playoff_bracket(standings, all_teams):
                 'wins_a': 0, 'wins_b': 0, 'winner': None,
             }
     return bracket
+
+
+# ── LIVE GAME ENGINE ─────────────────────────────────────────────────────────
+
+def _make_player_dict(row):
+    """Convert a DataFrame row to a player dict for live game state."""
+    return {
+        'name': row['PLAYER'],
+        'player_id': int(row['PLAYER_ID']),
+        'position': row.get('POSITION', '?') or '?',
+        'pts': float(row.get('PTS', 0)),
+        'reb': float(row.get('REB', 0)),
+        'ast': float(row.get('AST', 0)),
+        'stl': float(row.get('STL', 0)),
+        'blk': float(row.get('BLK', 0)),
+        'tov': float(row.get('TOV', 0)),
+        'fg_pct': float(row.get('FG_PCT', 0.45)),
+        'fg3_pct': float(row.get('FG3_PCT', 0.35)),
+        'ft_pct': float(row.get('FT_PCT', 0.75)),
+        'fg3a': float(row.get('FG3A', 2)),
+        'fga': float(row.get('FGA', 10)),
+        'min_avg': float(row.get('MIN', 24)),
+        'overall': int(row.get('OVERALL', 70)),
+        'stamina': 100,
+        'game_pts': 0,
+        'game_reb': 0,
+        'game_ast': 0,
+        'game_stl': 0,
+        'game_blk': 0,
+        'game_tov': 0,
+        'game_fgm': 0,
+        'game_fga': 0,
+        'game_fg3m': 0,
+        'game_fg3a': 0,
+        'game_ftm': 0,
+        'game_fta': 0,
+    }
+
+
+def init_live_game(lineup_df, roster_df, all_stats, all_teams, my_team_id, opponent_id, tactic,
+                   difficulty='Easy'):
+    """Initialize a live quarter-by-quarter game."""
+    hard = difficulty == 'Hard'
+    my_team = next(t for t in all_teams if t['id'] == my_team_id)
+    opp_team = next(t for t in all_teams if t['id'] == opponent_id)
+    opp_roster = all_stats[all_stats['TEAM_ID'] == opponent_id]
+
+    # User's on-court and bench
+    starter_names = lineup_df['PLAYER'].tolist()
+    injured_names = list(st.session_state.injured_list.keys())
+    my_on_court = [_make_player_dict(row) for _, row in lineup_df.iterrows()]
+    bench_df = roster_df[
+        ~roster_df['PLAYER'].isin(starter_names + injured_names)
+    ].sort_values('PTS', ascending=False)
+    my_bench = [_make_player_dict(row) for _, row in bench_df.iterrows()]
+
+    # Hard mode: apply season stamina carryover to user players
+    if hard:
+        season_stam = st.session_state.get('season_stamina', {})
+        for p in my_on_court + my_bench:
+            p['stamina'] = season_stam.get(p['name'], 100)
+
+    # Opponent on-court and bench
+    opp_top5 = opp_roster.nlargest(5, 'PTS')
+    opp_bench_df = opp_roster[~opp_roster['PLAYER'].isin(opp_top5['PLAYER'])].nlargest(5, 'PTS')
+    opp_on_court = [_make_player_dict(row) for _, row in opp_top5.iterrows()]
+    opp_bench = [_make_player_dict(row) for _, row in opp_bench_df.iterrows()]
+
+    return {
+        'quarter': 1,
+        'my_score': 0,
+        'opp_score': 0,
+        'my_on_court': my_on_court,
+        'my_bench': my_bench,
+        'opp_on_court': opp_on_court,
+        'opp_bench': opp_bench,
+        'play_by_play': [],
+        'tactic': tactic,
+        'quarter_scores': [],
+        'injuries': [],
+        'subs': [],
+        'opponent_id': opponent_id,
+        'opponent_name': opp_team['full_name'],
+        'my_team_id': my_team_id,
+        'my_team_abbr': my_team['abbreviation'],
+        'opp_team_abbr': opp_team['abbreviation'],
+        'finished': False,
+        'difficulty': difficulty,
+    }
+
+
+def simulate_quarter(live_game):
+    """Simulate one quarter. Returns list of play-by-play event strings."""
+    q = live_game['quarter']
+    is_ot = q > 4
+    possessions_per_team = 10 if is_ot else 24
+    tactic = live_game['tactic']
+    my_abbr = live_game['my_team_abbr']
+    opp_abbr = live_game['opp_team_abbr']
+    hard = live_game.get('difficulty', 'Easy') == 'Hard'
+    events = []
+    q_my_pts = 0
+    q_opp_pts = 0
+    quarter_mins = 5.0 if is_ot else 12.0
+
+    # Tactic modifiers — Hard mode: no net advantage from tactics
+    if hard:
+        if tactic == 'Pace & Space':
+            three_boost, opp_boost, own_boost = 1.2, 1.15, 1.15
+        elif tactic == 'Grit & Grind':
+            three_boost, opp_boost, own_boost = 0.8, 0.85, 0.85
+        else:
+            three_boost, opp_boost, own_boost = 1.0, 1.0, 1.0
+    else:
+        if tactic == 'Pace & Space':
+            three_boost, opp_boost, own_boost = 1.3, 1.1, 1.1
+        elif tactic == 'Grit & Grind':
+            three_boost, opp_boost, own_boost = 0.8, 0.8, 0.9
+        else:
+            three_boost, opp_boost, own_boost = 1.0, 1.0, 1.0
+
+    total_possessions = possessions_per_team * 2
+
+    for poss_i in range(total_possessions):
+        is_my_team = (poss_i % 2 == 0)
+        on_court = live_game['my_on_court'] if is_my_team else live_game['opp_on_court']
+        bench = live_game['my_bench'] if is_my_team else live_game['opp_bench']
+        team_abbr = my_abbr if is_my_team else opp_abbr
+        boost = own_boost if is_my_team else opp_boost
+
+        # Hard mode: opponent gets comeback boost when trailing by 8+
+        if hard and not is_my_team:
+            deficit = live_game['my_score'] - live_game['opp_score']
+            if deficit >= 8:
+                boost *= 1.08
+
+        if not on_court:
+            continue
+
+        # Pick player weighted by PTS
+        weights = [max(p['pts'], 0.5) for p in on_court]
+        total_w = sum(weights)
+        player = random.choices(on_court, weights=[w / total_w for w in weights])[0]
+
+        # Time remaining
+        time_remaining = quarter_mins * (1 - poss_i / total_possessions)
+        mins = int(time_remaining)
+        secs = int((time_remaining - mins) * 60)
+        time_str = f"{mins}:{secs:02d}"
+        q_label = f"OT{q - 4}" if is_ot else f"Q{q}"
+
+        # Stamina modifier
+        stam_mod = stamina_performance_modifier(player['stamina'])
+
+        # Determine outcome
+        fg3_rate = min(player['fg3a'] / max(player['fga'], 1), 0.5) * three_boost
+        roll = random.random()
+
+        pts_scored = 0
+        event_text = ""
+
+        if roll < 0.40 * stam_mod * boost:
+            # Made 2pt
+            pts_scored = 2
+            player['game_fga'] += 1
+            player['game_fgm'] += 1
+            event_text = f"{player['name']} scores inside"
+        elif roll < (0.40 + 0.15 * fg3_rate / 0.35) * stam_mod * boost:
+            # Made 3pt
+            pts_scored = 3
+            player['game_fga'] += 1
+            player['game_fgm'] += 1
+            player['game_fg3a'] += 1
+            player['game_fg3m'] += 1
+            event_text = f"{player['name']} hits a 3-pointer"
+        elif roll < (0.40 + 0.15 * fg3_rate / 0.35 + 0.10) * stam_mod * boost:
+            # Free throw foul
+            fts_made = 0
+            for _ in range(2):
+                player['game_fta'] += 1
+                if random.random() < player['ft_pct'] * stam_mod:
+                    fts_made += 1
+                    player['game_ftm'] += 1
+            pts_scored = fts_made
+            event_text = f"{player['name']} goes to the line, makes {fts_made}/2 FTs"
+        elif roll < 0.90:
+            # Miss
+            player['game_fga'] += 1
+            # Rebound attributed to a random player
+            rebounder = random.choice(on_court)
+            rebounder['game_reb'] += 1
+            event_text = f"{player['name']} misses"
+        else:
+            # Turnover
+            player['game_tov'] += 1
+            opp_court = live_game['opp_on_court'] if is_my_team else live_game['my_on_court']
+            if opp_court:
+                stealer = random.choice(opp_court)
+                stealer['game_stl'] += 1
+                event_text = f"Turnover by {player['name']}, stolen by {stealer['name']}"
+            else:
+                event_text = f"Turnover by {player['name']}"
+
+        if pts_scored > 0:
+            player['game_pts'] += pts_scored
+            if is_my_team:
+                live_game['my_score'] += pts_scored
+                q_my_pts += pts_scored
+            else:
+                live_game['opp_score'] += pts_scored
+                q_opp_pts += pts_scored
+
+        score_str = f"{my_abbr} {live_game['my_score']}, {opp_abbr} {live_game['opp_score']}"
+        events.append(f"{q_label} {time_str} — {event_text} ({score_str})")
+
+        # Drain stamina
+        drain = stamina_drain_per_quarter(player['min_avg'], tactic) / possessions_per_team
+        player['stamina'] = max(0, player['stamina'] - drain)
+        # Other on-court players drain at 40% rate
+        for p in on_court:
+            if p is not player:
+                p['stamina'] = max(0, p['stamina'] - drain * 0.4)
+
+        # Auto-sub if stamina critically low
+        if player['stamina'] < 15 and bench:
+            sub_in = bench.pop(0)
+            on_court.remove(player)
+            bench.append(player)
+            on_court.append(sub_in)
+            sub_event = f"↔ {sub_in['name']} subs in for {player['name']} ({team_abbr})"
+            events.append(f"{q_label} {time_str} — {sub_event}")
+            live_game['subs'].append(sub_event)
+
+        # Injury check — Hard mode: more frequent and severe
+        if hard:
+            inj_chance = 0.005 + (100 - player['stamina']) / 2000
+        else:
+            inj_chance = 0.003 + (100 - player['stamina']) / 3000
+        if random.random() < inj_chance and player['name'] not in [i['name'] for i in live_game.get('injuries', [])]:
+            severity = random.random()
+            if hard:
+                if severity < 0.35:
+                    duration, tier = random.randint(1, 3), "MINOR"
+                elif severity < 0.70:
+                    duration, tier = random.randint(3, 8), "MODERATE"
+                else:
+                    duration, tier = random.randint(8, 20), "SEVERE"
+            elif severity < 0.6:
+                duration, tier = random.randint(1, 2), "MINOR"
+            elif severity < 0.9:
+                duration, tier = random.randint(3, 6), "MODERATE"
+            else:
+                duration, tier = random.randint(8, 15), "SEVERE"
+            live_game['injuries'].append({
+                'name': player['name'], 'duration': duration, 'tier': tier,
+            })
+            inj_event = f"🚨 {player['name']} — {tier} injury, OUT {duration} game{'s' if duration > 1 else ''}!"
+            events.append(f"{q_label} {time_str} — {inj_event}")
+            # Sub out injured player
+            if bench:
+                sub_in = bench.pop(0)
+                on_court.remove(player)
+                bench.append(player)
+                player['stamina'] = 0
+                on_court.append(sub_in)
+
+    # Bench recovery
+    for p in live_game['my_bench']:
+        p['stamina'] = min(100, p['stamina'] + 8)
+    for p in live_game['opp_bench']:
+        p['stamina'] = min(100, p['stamina'] + 8)
+
+    # Record quarter scores
+    live_game['quarter_scores'].append((q_my_pts, q_opp_pts))
+    live_game['play_by_play'].extend(events)
+    live_game['quarter'] += 1
+
+    # Check if game is over
+    if q >= 4 and live_game['my_score'] != live_game['opp_score']:
+        live_game['finished'] = True
+
+    return events
+
+
+def apply_user_subs(live_game, sub_out_name, sub_in_name):
+    """Swap one player between on_court and bench."""
+    on_court = live_game['my_on_court']
+    bench = live_game['my_bench']
+
+    sub_out = next((p for p in on_court if p['name'] == sub_out_name), None)
+    sub_in = next((p for p in bench if p['name'] == sub_in_name), None)
+
+    if sub_out and sub_in:
+        on_court.remove(sub_out)
+        bench.remove(sub_in)
+        on_court.append(sub_in)
+        bench.append(sub_out)
+        live_game['subs'].append(f"↔ {sub_in_name} subs in for {sub_out_name}")
+        return True
+    return False
+
+
+def finalize_live_game(live_game):
+    """Convert live game state into the standard result format."""
+    box_score = []
+
+    # Combine on-court and bench for full roster stats
+    all_players = live_game['my_on_court'] + live_game['my_bench']
+    for p in all_players:
+        if p['game_pts'] > 0 or p['game_reb'] > 0 or p['game_ast'] > 0 or p.get('game_fga', 0) > 0:
+            box_score.append({
+                "Player": p['name'],
+                "PLAYER_ID": p['player_id'],
+                "Points": p['game_pts'],
+                "Stamina Left": int(p['stamina']),
+            })
+
+    # Add bench aggregate for remaining contribution
+    box_score.append({
+        "Player": "Bench / Role Players",
+        "PLAYER_ID": 0,
+        "Points": 0,
+        "Stamina Left": 100,
+    })
+
+    injury_reports = [
+        f"🚨 {inj['name']} — {inj['tier']} injury, OUT {inj['duration']} game{'s' if inj['duration'] > 1 else ''}!"
+        for inj in live_game.get('injuries', [])
+    ]
+    sub_reports = live_game.get('subs', [])
+
+    # Register injuries in session state
+    for inj in live_game.get('injuries', []):
+        st.session_state.injured_list[inj['name']] = inj['duration']
+
+    # Hard mode: record end-of-game stamina for carryover
+    if live_game.get('difficulty', 'Easy') == 'Hard':
+        new_season_stam = dict(st.session_state.get('season_stamina', {}))
+        on_court_names = {p['name'] for p in live_game['my_on_court']}
+        for p in all_players:
+            if p['name'] in on_court_names:
+                new_season_stam[p['name']] = min(100, max(int(p['stamina']) + 15, 70))
+            else:
+                new_season_stam[p['name']] = min(100, new_season_stam.get(p['name'], 100) + 25)
+        st.session_state.season_stamina = new_season_stam
+
+    return (
+        live_game['my_score'],
+        live_game['opp_score'],
+        box_score,
+        injury_reports,
+        sub_reports,
+        live_game['opponent_name'],
+    )

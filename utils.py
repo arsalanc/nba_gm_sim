@@ -67,6 +67,30 @@ def get_win_probability(strength_a, strength_b):
     return 1 / (1 + 10 ** (-diff / 15))
 
 
+# --- STAMINA HELPERS ---
+def stamina_drain_per_quarter(player_min, tactic='Balanced'):
+    """Stamina drain for one quarter based on real MPG.
+    1200/MIN → 36 MPG ~33/Q, 24 MPG ~50/Q, 12 MPG ~100/Q."""
+    clamped_min = max(player_min, 4)
+    base_drain = 1200 / clamped_min
+    base_drain = max(15, min(100, base_drain))
+    if tactic == 'Grit & Grind':
+        base_drain *= 1.3
+    elif tactic == 'Pace & Space':
+        base_drain *= 1.1
+    return base_drain
+
+
+def stamina_performance_modifier(stamina):
+    """Returns 0.4–1.0 multiplier based on current stamina."""
+    if stamina >= 70:
+        return 1.0
+    elif stamina >= 40:
+        return 0.7 + (stamina - 40) * 0.01
+    else:
+        return max(0.4, 0.4 + stamina * 0.0075)
+
+
 # --- SALARY / FORMATTING ---
 def estimate_salary(pts):
     if pts >= 25: return 35_000_000
@@ -88,10 +112,10 @@ def overall_badge(ovr):
 
 # --- PERSISTENCE ---
 def save_state():
-    keys = ['my_team_id', 'results', 'season_pts', 'injured_list',
-            'stamina', 'my_roster_overrides', 'trade_history',
+    keys = ['my_team_id', 'difficulty', 'results', 'season_pts', 'injured_list',
+            'my_roster_overrides', 'trade_history',
             'standings', 'games_played', 'season_phase', 'playoff_bracket',
-            'current_series']
+            'current_series', 'live_game', 'season_stamina', 'trade_cooldown']
     state = {k: st.session_state.get(k) for k in keys}
     with open(SAVE_FILE, 'w') as f:
         json.dump(state, f)
@@ -155,7 +179,7 @@ def load_nba_data():
 
 
 # --- TRADE EVALUATION ---
-def evaluate_trade(my_players_df, their_players_df):
+def evaluate_trade(my_players_df, their_players_df, difficulty='Easy'):
     """Return (accepted, my_pts, their_pts, my_sal, their_sal)."""
     my_pts = my_players_df['PTS'].sum()
     their_pts = their_players_df['PTS'].sum()
@@ -164,7 +188,8 @@ def evaluate_trade(my_players_df, their_players_df):
 
     # NBA salary matching: incoming ≤ outgoing * 1.25 + $100K
     salary_ok = their_sal <= my_sal * 1.25 + 100_000
-    # AI GM won't give up more than 15% better PPG
-    value_ok = their_pts <= my_pts * 1.15
+    # AI GM threshold — Hard: won't give up more than 5% better PPG; Easy: 15%
+    threshold = 1.05 if difficulty == 'Hard' else 1.15
+    value_ok = their_pts <= my_pts * threshold
 
     return salary_ok and value_ok, my_pts, their_pts, my_sal, their_sal

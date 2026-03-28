@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+import time
 
 from utils import (
     SAVE_FILE, player_img_url, team_logo_url, fmt_salary, overall_badge,
@@ -11,6 +12,7 @@ from engine import (
     simulate_game, post_game_updates, generate_round_matchups,
     find_user_matchup, simulate_other_games, update_standings,
     auto_select_lineup, generate_playoff_bracket, simulate_playoff_series,
+    init_live_game, simulate_quarter, apply_user_subs, finalize_live_game,
 )
 
 # --- CONSTANTS ---
@@ -185,10 +187,10 @@ all_teams, all_stats = load_nba_data()
 # Default session state (skipped if already loaded from save)
 _defaults = {
     'my_team_id': None,
+    'difficulty': 'Easy',
     'results': [],
     'season_pts': {},
     'injured_list': {},
-    'stamina': {},
     'my_roster_overrides': {},
     'trade_history': [],
     'standings': {},
@@ -196,6 +198,9 @@ _defaults = {
     'season_phase': 'regular',
     'playoff_bracket': None,
     'current_series': None,
+    'live_game': None,
+    'season_stamina': {},       # Hard mode: per-player stamina carryover between games
+    'trade_cooldown': 0,        # Hard mode: games remaining with chemistry penalty
     'last_game_result': None,   # transient — not saved to file
     'batch_results': None,      # transient — batch sim summary
     'current_starters': [],     # transient — tracks live checkbox selection
@@ -212,8 +217,19 @@ if st.session_state.my_team_id is None:
     preview_id = team_map[selected]
     logo_col, _ = st.columns([1, 4])
     logo_col.image(team_logo_url(preview_id), width=120)
+
+    diff_choice = st.radio(
+        "Difficulty:",
+        ["Easy", "Hard"],
+        horizontal=True,
+        help="**Easy:** Relaxed sim, opponents are inconsistent. Great for casual play.\n\n"
+             "**Hard:** Opponents play at full strength, tactic advantages are removed, "
+             "injuries are more frequent, stamina carries over between games, and trades are harder to pull off.",
+    )
+
     if st.button("✍️ Sign Contract"):
         st.session_state.my_team_id = team_map[selected]
+        st.session_state.difficulty = diff_choice
         st.session_state.standings = {t['id']: {'w': 0, 'l': 0} for t in all_teams}
         save_state()
         st.rerun()
@@ -240,13 +256,17 @@ else:
     st.sidebar.image(team_logo_url(current_team_id), width=80)
     games_played = st.session_state.get('games_played', 0)
     season_phase = st.session_state.get('season_phase', 'regular')
+    difficulty = st.session_state.get('difficulty', 'Easy')
+    hard = difficulty == 'Hard'
+
     st.sidebar.header(my_team['full_name'])
+    diff_badge = "🔴 Hard" if hard else "🟢 Easy"
     if season_phase == 'regular':
-        st.sidebar.write(f"**Record:** {w}W — {l}L  ·  Game {games_played}/82")
+        st.sidebar.write(f"**Record:** {w}W — {l}L  ·  Game {games_played}/82  ·  {diff_badge}")
     elif season_phase in ('playoffs_user', 'playoffs_spectate'):
-        st.sidebar.write(f"**Record:** {w}W — {l}L  ·  Playoffs")
+        st.sidebar.write(f"**Record:** {w}W — {l}L  ·  Playoffs  ·  {diff_badge}")
     else:
-        st.sidebar.write(f"**Record:** {w}W — {l}L")
+        st.sidebar.write(f"**Record:** {w}W — {l}L  ·  {diff_badge}")
 
     # Salary cap
     st.sidebar.divider()
@@ -276,19 +296,10 @@ else:
     else:
         st.sidebar.caption("No injuries")
 
-    # Stamina tracker
-    st.sidebar.divider()
-    st.sidebar.subheader("🔋 Stamina Tracker")
-    starters_shown = False
-    for p_name, stam in st.session_state.stamina.items():
-        if p_name in st.session_state.injured_list:
-            continue
-        icon = "🟢" if stam >= 60 else "🟡" if stam >= 30 else "🔴"
-        st.sidebar.write(f"{icon} {p_name} ({stam}%)")
-        st.sidebar.progress(stam / 100)
-        starters_shown = True
-    if not starters_shown:
-        st.sidebar.caption("Play a game to see stamina.")
+    if hard and st.session_state.get('trade_cooldown', 0) > 0:
+        st.sidebar.divider()
+        st.sidebar.warning(f"⚠️ Chemistry disruption: **{st.session_state.trade_cooldown}** games left "
+                           f"(-5% scoring)")
 
     st.sidebar.divider()
     if st.sidebar.button("🔄 Reset Game"):
@@ -304,8 +315,7 @@ else:
     # render — to keep Gameplan in sync on every rerun.
     _injured = list(st.session_state.injured_list.keys())
     _healthy = roster[~roster['PLAYER'].isin(_injured)].sort_values('PTS', ascending=False)
-    _rested = [p for p in _healthy['PLAYER'] if st.session_state.get(f"rest_{p}", False)]
-    _available = _healthy[~_healthy['PLAYER'].isin(_rested)].head(10)
+    _available = _healthy.head(10)
     _suggested = _available.nlargest(5, 'PTS')['PLAYER'].tolist()
     st.session_state.current_starters = [
         row['PLAYER'] for _, row in _available.iterrows()
@@ -313,8 +323,8 @@ else:
     ]
 
     # ── MAIN TABS ─────────────────────────────────────────────────────────────
-    tab_gameplan, tab_game, tab_trade, tab_standings, tab_stats = st.tabs(
-        ["📝 Gameplan", "🏟️ Game Day", "📋 Trade Desk", "🏆 Standings", "📊 Season Stats"]
+    tab_gameplan, tab_game, tab_trade, tab_standings, tab_bracket, tab_stats = st.tabs(
+        ["📝 Gameplan", "🏟️ Game Day", "📋 Trade Desk", "🏆 Standings", "🏀 Bracket", "📊 Season Stats"]
     )
 
     # ── GAMEPLAN ──────────────────────────────────────────────────────────────
@@ -387,12 +397,11 @@ else:
                 # ── Side-by-side rosters ──────────────────────────────────────
                 col_yours, col_theirs = st.columns(2)
 
-                def render_player_card(col, player_row, stamina_dict=None, injured_list=None):
+                def render_player_card(col, player_row, injured_list=None):
                     ovr = int(player_row['OVERALL'])
                     name = player_row['PLAYER']
                     pid = int(player_row['PLAYER_ID'])
                     pos = player_row.get('POSITION', '?') or '?'
-                    stam = stamina_dict.get(name, 100) if stamina_dict else None
                     is_injured = injured_list and name in injured_list
 
                     img_c, info_c = col.columns([1, 3])
@@ -409,10 +418,6 @@ else:
                     if 'AST' in player_row: stat_parts.append(f"{player_row['AST']:.1f} AST")
                     info_c.caption(" · ".join(stat_parts))
 
-                    if stam is not None:
-                        stam_icon = "🟢" if stam >= 60 else "🟡" if stam >= 30 else "🔴"
-                        info_c.caption(f"Stamina: {stam_icon} {stam}%")
-
                 with col_yours:
                     lc, nc = st.columns([1, 4])
                     lc.image(team_logo_url(current_team_id), width=50)
@@ -426,7 +431,6 @@ else:
                     injured_names_set = st.session_state.injured_list
                     for _, row in display_df.iterrows():
                         render_player_card(col_yours, row,
-                                           stamina_dict=st.session_state.stamina,
                                            injured_list=injured_names_set)
                         col_yours.write("")
 
@@ -467,326 +471,528 @@ else:
                     f"— their primary scorer."
                 )
 
-                low_stam = [
-                    f"{r['PLAYER']} ({st.session_state.stamina.get(r['PLAYER'], 100)}%)"
-                    for _, r in my_starters_default.iterrows()
-                    if st.session_state.stamina.get(r['PLAYER'], 100) < 40
-                ]
-                if low_stam:
-                    advice_lines.append(
-                        f"🔴 **Fatigue alert:** {', '.join(low_stam)} are running low. "
-                        f"Consider resting them or expect subs mid-game."
-                    )
-
                 for line in advice_lines:
                     st.markdown(line)
 
     # ── GAME DAY ──────────────────────────────────────────────────────────────
     with tab_game:
-        injured_names = list(st.session_state.injured_list.keys())
-        healthy_roster = roster[~roster['PLAYER'].isin(injured_names)].sort_values('PTS', ascending=False)
+        live = st.session_state.get('live_game')
 
-        st.subheader("Load Management")
-        st.caption("Rest players to skip this game and gain +40 stamina. Starters only drain -15/-20 per game.")
-        rest_cols = st.columns(4)
-        rested_players = []
-        for i, (_, row) in enumerate(healthy_roster.head(12).iterrows()):
-            col = rest_cols[i % 4]
-            stam = st.session_state.stamina.get(row['PLAYER'], 100)
-            icon = "🟢" if stam >= 60 else "🟡" if stam >= 30 else "🔴"
-            if col.checkbox(
-                f"{icon} {row['PLAYER'].split()[-1]} ({stam}%)",
-                key=f"rest_{row['PLAYER']}"
-            ):
-                rested_players.append(row['PLAYER'])
+        # ── LIVE GAME IN PROGRESS ────────────────────────────────────────────
+        if live and not live.get('finished'):
+            lg = live
+            q = lg['quarter']
+            is_ot = q > 4
+            q_label = f"OT{q - 4}" if is_ot else f"Quarter {q}"
 
-        available_players = [p for p in healthy_roster['PLAYER'].tolist() if p not in rested_players]
-        available_df = healthy_roster[healthy_roster['PLAYER'].isin(available_players)]
-
-        st.divider()
-        st.subheader("Pick Your Lineup")
-        st.caption("Check up to 5 players to start. Top 5 scorers are pre-selected.")
-
-        suggested = available_df.nlargest(5, 'PTS')['PLAYER'].tolist()
-        starters = []
-        card_cols = st.columns(5)
-        for i, (_, row) in enumerate(available_df.head(10).iterrows()):
-            col = card_cols[i % 5]
-            stam = st.session_state.stamina.get(row['PLAYER'], 100)
-            stam_icon = "🟢" if stam >= 60 else "🟡" if stam >= 30 else "🔴"
-            pos = row.get('POSITION', '?') or '?'
-            col.image(player_img_url(int(row['PLAYER_ID'])), width=90)
-            selected = col.checkbox(
-                row['PLAYER'],
-                value=row['PLAYER'] in suggested,
-                key=f"starter_{row['PLAYER']}",
-            )
-            col.caption(
-                f"`{pos}` · OVR {overall_badge(int(row['OVERALL']))}  \n"
-                f"{row['PTS']:.1f} PPG · {fmt_salary(row['SALARY'])}  \n"
-                f"Stamina: {stam_icon} {stam}%"
-            )
-            if selected:
-                starters.append(row['PLAYER'])
-
-        n = len(starters)
-        if n > 0:
-            starter_sal = roster[roster['PLAYER'].isin(starters)]['SALARY'].sum()
-            status = f"{n}/5 selected · {fmt_salary(starter_sal)}"
-            if n == 5 and starter_sal > SALARY_CAP:
-                st.warning(f"⚠️ Cap Violation — {status}")
-            elif n == 5:
-                st.success(f"✅ Lineup locked — {status}")
-            else:
-                st.info(f"{status}")
-
-        st.subheader("📋 Game Plan")
-        tactic = st.radio("Select Strategy:", ["Balanced", "Pace & Space", "Grit & Grind"], horizontal=True)
-        st.caption({
-            "Balanced": "1.0× offense and defense.",
-            "Pace & Space": "1.2× your score, 1.1× opponent score. High-risk, high-reward.",
-            "Grit & Grind": "0.9× your score, 0.8× opponent score. Defensive identity, more stamina drain.",
-        }[tactic])
-
-        if season_phase == 'playoffs_spectate':
-            st.info("🏁 Your season is over. Watch the playoffs unfold from the **Standings** tab.")
-            bracket = st.session_state.playoff_bracket
-            if bracket and not bracket.get('champion'):
-                if st.button("📺 Simulate Next Playoff Round"):
-                    _sim_playoff_round(bracket, all_stats)
-                    save_state()
-                    st.rerun()
-
-        elif season_phase == 'playoffs_user':
-            series = st.session_state.current_series
-            bracket = st.session_state.playoff_bracket
-            if series and bracket and not bracket.get('champion'):
-                opp_id = series['opponent_id']
-                opp_info = next((t for t in all_teams if t['id'] == opp_id), None)
-                round_labels = {'round1': 'First Round', 'round2': 'Semifinals',
-                                'conf_finals': 'Conference Finals', 'finals': 'NBA Finals'}
-                st.subheader(f"🏀 {round_labels.get(series['round'], 'Playoffs')}")
-                if opp_info:
-                    lc, mc = st.columns([1, 4])
-                    lc.image(team_logo_url(opp_id), width=70)
-                    mc.write(f"**vs {opp_info['full_name']}**")
-                    mc.write(f"Series: {my_team['abbreviation']} **{series['user_wins']}** — "
-                             f"**{series['opp_wins']}** {opp_info['abbreviation']}")
-
-                if st.button("🏟️ Sim Playoff Game"):
-                    if len(starters) != 5:
-                        st.error("Select exactly 5 starters.")
-                    else:
-                        lineup_df = roster[roster['PLAYER'].isin(starters)]
-                        p_mod = 1.2 if tactic == "Pace & Space" else 0.9 if tactic == "Grit & Grind" else 1.0
-                        o_mod = 1.1 if tactic == "Pace & Space" else 0.8 if tactic == "Grit & Grind" else 1.0
-
-                        score, opp_score, box_score, injury_reports, sub_reports, opp_name = simulate_game(
-                            lineup_df, roster, tactic, all_stats, all_teams,
-                            current_team_id, rested_players,
-                            opponent_team_id=series['opponent_id'],
-                        )
-                        final_score = int(score * p_mod)
-                        final_opp = int(opp_score * o_mod)
-                        res = "W" if final_score > final_opp else "L"
-
-                        starter_names_list = lineup_df['PLAYER'].tolist()
-                        post_game_updates(starter_names_list, rested_players, roster)
-
-                        if res == 'W':
-                            series['user_wins'] += 1
-                        else:
-                            series['opp_wins'] += 1
-
-                        st.session_state.last_game_result = {
-                            'final_score': final_score, 'final_opp': final_opp,
-                            'res': res, 'box_score': box_score,
-                            'injury_reports': injury_reports, 'sub_reports': sub_reports,
-                            'opp_name': opp_name, 'played_opp_id': series['opponent_id'],
-                        }
-                        if res == 'W':
-                            st.session_state.show_balloons = True
-
-                        # Check if series is over
-                        if series['user_wins'] == 4 or series['opp_wins'] == 4:
-                            user_won = series['user_wins'] == 4
-                            _finish_user_series(bracket, series, current_team_id, user_won,
-                                                all_stats)
-
-                        st.session_state.current_series = series
-                        save_state()
-                        st.rerun()
-            else:
-                st.info("Check the **Standings** tab for playoff results.")
-
-        elif games_played >= 82:
-            st.info("🏁 Regular season is complete! Head to **Standings** to see playoff picture.")
-        else:
-            remaining = 82 - games_played
-            sim_col1, sim_col2, sim_col3 = st.columns(3)
-            sim_1 = sim_col1.button("🏟️ Sim 1 Game", key="sim_1",
-                                     disabled=remaining < 1)
-            sim_5 = sim_col2.button("⏩ Sim 5 Games", key="sim_5",
-                                     disabled=remaining < 1)
-            sim_10 = sim_col3.button("⏭️ Sim 10 Games", key="sim_10",
-                                      disabled=remaining < 1)
-
-            num_games = 0
-            if sim_1: num_games = min(1, remaining)
-            elif sim_5: num_games = min(5, remaining)
-            elif sim_10: num_games = min(10, remaining)
-
-            if num_games > 0:
-                if len(starters) != 5:
-                    st.error("Select exactly 5 starters to continue.")
-                else:
-                    p_mod = 1.2 if tactic == "Pace & Space" else 0.9 if tactic == "Grit & Grind" else 1.0
-                    o_mod = 1.1 if tactic == "Pace & Space" else 0.8 if tactic == "Grit & Grind" else 1.0
-                    batch_results = []
-
-                    for game_i in range(num_games):
-                        gp = st.session_state.games_played
-                        if gp >= 82:
-                            break
-
-                        # Game 0 uses manual lineup; subsequent games auto-select
-                        if game_i == 0:
-                            lineup_df = roster[roster['PLAYER'].isin(starters)]
-                            current_rested = rested_players
-                        else:
-                            lineup_df, current_rested = auto_select_lineup(
-                                roster, st.session_state.injured_list, st.session_state.stamina
-                            )
-
-                        # Get schedule-based opponent
-                        matchups = generate_round_matchups(all_teams, gp)
-                        opp_id, _ = find_user_matchup(matchups, current_team_id)
-
-                        score, opp_score, box_score, injury_reports, sub_reports, opp_name = simulate_game(
-                            lineup_df, roster, tactic, all_stats, all_teams,
-                            current_team_id, current_rested,
-                            opponent_team_id=opp_id,
-                        )
-
-                        final_score = int(score * p_mod)
-                        final_opp = int(opp_score * o_mod)
-                        res = "W" if final_score > final_opp else "L"
-                        st.session_state.results.append(res)
-
-                        starter_names = lineup_df['PLAYER'].tolist()
-                        post_game_updates(starter_names, current_rested, roster)
-
-                        # Accumulate season points
-                        for p in box_score:
-                            if int(p['PLAYER_ID']) == 0:
-                                continue
-                            clean_name = p['Player'].split(" (sub")[0].replace("↔ ", "").strip()
-                            if " (sub for " in clean_name:
-                                clean_name = clean_name.split(" (sub for ")[0]
-                            st.session_state.season_pts[clean_name] = (
-                                st.session_state.season_pts.get(clean_name, 0) + p['Points']
-                            )
-
-                        # Sim the other 14 matchups in this round
-                        other_results = simulate_other_games(matchups, current_team_id, all_stats)
-                        # Build full round results for standings
-                        opp_res = 'L' if res == 'W' else 'W'
-                        all_results = {current_team_id: res, opp_id: opp_res, **other_results}
-                        update_standings(st.session_state.standings, all_results)
-
-                        st.session_state.games_played += 1
-
-                        batch_results.append({
-                            'final_score': final_score,
-                            'final_opp': final_opp,
-                            'res': res,
-                            'box_score': box_score,
-                            'injury_reports': injury_reports,
-                            'sub_reports': sub_reports,
-                            'opp_name': opp_name,
-                            'played_opp_id': opp_id,
-                        })
-
-                    # Store the last game for detailed display and batch summary
-                    if batch_results:
-                        st.session_state.last_game_result = batch_results[-1]
-                        st.session_state.batch_results = batch_results
-                        batch_w = sum(1 for g in batch_results if g['res'] == 'W')
-                        if batch_w == len(batch_results):
-                            st.session_state.show_balloons = True
-
-                        # Check if season just ended
-                        if st.session_state.games_played >= 82:
-                            st.session_state.season_phase = 'playoffs_pending'
-
-                        save_state()
-                        st.rerun()
-
-        # ── Last game result (rendered from session state after rerun) ─────────
-        if st.session_state.get('show_balloons'):
-            st.balloons()
-            st.session_state.show_balloons = False
-
-        # Batch summary (if multiple games were simmed)
-        batch = st.session_state.get('batch_results')
-        if batch and len(batch) > 1:
-            batch_w = sum(1 for g in batch if g['res'] == 'W')
-            batch_l = len(batch) - batch_w
-            st.subheader(f"Batch Results: {batch_w}W — {batch_l}L in {len(batch)} games")
-            with st.expander("Game-by-game scores"):
-                for i, g in enumerate(batch):
-                    icon = "✅" if g['res'] == 'W' else "❌"
-                    st.write(f"{icon} Game {games_played - len(batch) + i + 1}: "
-                             f"{my_team['abbreviation']} {g['final_score']} — "
-                             f"{g['opp_name']} {g['final_opp']}")
-            st.caption("Detailed box score shown for the last game:")
-
-        r = st.session_state.get('last_game_result')
-        if r:
+            # Scoreboard
+            st.subheader(f"🏀 {lg['my_team_abbr']} vs {lg['opp_team_abbr']} — {q_label}")
             sc_my, sc_vs, sc_opp = st.columns([3, 1, 3])
             with sc_my:
                 lc, mc = st.columns([1, 2])
-                lc.image(team_logo_url(current_team_id), width=70)
-                mc.metric(my_team['abbreviation'], r['final_score'],
-                          delta=r['final_score'] - r['final_opp'])
+                lc.image(team_logo_url(lg['my_team_id']), width=60)
+                mc.metric(lg['my_team_abbr'], lg['my_score'])
             sc_vs.markdown(
-                "<div style='text-align:center;padding-top:16px;font-size:1.2rem;font-weight:bold'>FINAL</div>",
+                "<div style='text-align:center;padding-top:12px;font-size:1rem;font-weight:bold'>"
+                f"{'OT' + str(q-4) if is_ot else 'Q' + str(q)}</div>",
                 unsafe_allow_html=True,
             )
             with sc_opp:
                 lc, mc = st.columns([1, 2])
-                if r['played_opp_id']:
-                    lc.image(team_logo_url(r['played_opp_id']), width=70)
-                mc.metric(r['opp_name'], r['final_opp'])
+                lc.image(team_logo_url(lg['opponent_id']), width=60)
+                mc.metric(lg['opp_team_abbr'], lg['opp_score'])
 
-            for ir in r['injury_reports']:
-                st.warning(f"🚑 {ir}")
-            for sr in r['sub_reports']:
-                st.info(sr)
+            # Quarter-by-quarter scores
+            if lg['quarter_scores']:
+                q_cols = st.columns(len(lg['quarter_scores']) + 1)
+                for qi, (mq, oq) in enumerate(lg['quarter_scores']):
+                    ql = f"OT{qi - 3}" if qi >= 4 else f"Q{qi + 1}"
+                    q_cols[qi].caption(f"**{ql}**\n{mq} - {oq}")
+                q_cols[-1].caption(f"**Total**\n{lg['my_score']} - {lg['opp_score']}")
 
-            st.subheader("Box Score")
-            hdr = st.columns([1, 3, 1, 1, 2])
-            hdr[0].write("**Photo**")
-            hdr[1].write("**Player**")
-            hdr[2].write("**Pos**")
-            hdr[3].write("**PTS**")
-            hdr[4].write("**Stamina**")
             st.divider()
-            for p in r['box_score']:
-                rc = st.columns([1, 3, 1, 1, 2])
-                pid = int(p['PLAYER_ID'])
-                if pid == 0:
-                    rc[0].write("🪑")
+
+            # Court view
+            st.markdown(
+                '<div style="background:#1a472a;border:3px solid white;border-radius:12px;'
+                'padding:15px 10px 10px;text-align:center;">'
+                '<div style="border:2px solid rgba(255,255,255,0.5);width:35%;margin:auto;'
+                'height:40px;border-radius:0 0 50% 50%;margin-bottom:8px;"></div>'
+                '<div style="color:rgba(255,255,255,0.4);font-size:0.8rem;">ON COURT</div></div>',
+                unsafe_allow_html=True,
+            )
+            court_cols = st.columns(5)
+            for ci, p in enumerate(lg['my_on_court'][:5]):
+                with court_cols[ci]:
+                    st.image(player_img_url(p['player_id']), width=55)
+                    st.caption(f"**{p['name'].split()[-1]}**\n`{p['position']}`")
+                    stam = int(p['stamina'])
+                    stam_icon = "🟢" if stam >= 60 else "🟡" if stam >= 30 else "🔴"
+                    st.progress(max(stam, 0) / 100)
+                    st.caption(f"{stam_icon} {stam}% · {p['game_pts']} pts")
+
+            st.divider()
+
+            # Strategy change
+            new_tactic = st.radio(
+                "Strategy for next quarter:",
+                ["Balanced", "Pace & Space", "Grit & Grind"],
+                index=["Balanced", "Pace & Space", "Grit & Grind"].index(lg['tactic']),
+                horizontal=True,
+                key="live_tactic",
+            )
+            lg['tactic'] = new_tactic
+
+            # Substitution panel
+            st.subheader("↔ Substitutions")
+            sub_col1, sub_col2 = st.columns(2)
+            with sub_col1:
+                st.caption("**On Court**")
+                on_court_names = [p['name'] for p in lg['my_on_court']]
+                sub_out = st.selectbox("Sub out:", on_court_names, key="sub_out")
+            with sub_col2:
+                st.caption("**Bench**")
+                bench_names = [f"{p['name']} ({int(p['stamina'])}%)" for p in lg['my_bench']]
+                if bench_names:
+                    sub_in_idx = st.selectbox("Sub in:", range(len(bench_names)),
+                                              format_func=lambda i: bench_names[i], key="sub_in")
+                    sub_in_name = lg['my_bench'][sub_in_idx]['name'] if bench_names else None
                 else:
-                    rc[0].image(player_img_url(pid), width=50)
-                rc[1].write(p['Player'])
-                p_row = all_stats[all_stats['PLAYER_ID'] == p['PLAYER_ID']]
-                pos = p_row.iloc[0].get('POSITION', '?') if not p_row.empty else '—'
-                rc[2].write(f"`{pos or '?'}`")
-                rc[3].write(str(p['Points']))
-                stam = p['Stamina Left']
-                icon = "🟢" if stam >= 60 else "🟡" if stam >= 30 else "🔴"
-                rc[4].write(f"{icon} {stam}%")
+                    st.caption("No bench players available")
+                    sub_in_name = None
+
+            if sub_in_name and st.button("✅ Confirm Substitution", key="confirm_sub"):
+                apply_user_subs(lg, sub_out, sub_in_name)
+                save_state()
+                st.rerun()
+
+            st.divider()
+
+            # Play-by-play log from previous quarters
+            if lg['play_by_play']:
+                with st.expander(f"Play-by-play (Q1–Q{q-1})", expanded=False):
+                    for event in lg['play_by_play'][-50:]:
+                        st.text(event)
+
+            # Action button — play next quarter
+            btn_label = f"▶️ Play {'Overtime' if is_ot else q_label}"
+            if st.button(btn_label, key="play_quarter", type="primary"):
+                events = simulate_quarter(lg)
+                # Animate play-by-play
+                pbp_container = st.empty()
+                displayed = []
+                for event in events:
+                    displayed.append(event)
+                    pbp_container.markdown("```\n" + "\n".join(displayed[-10:]) + "\n```")
+                    time.sleep(0.12)
+                st.session_state.live_game = lg
+                save_state()
+                st.rerun()
+
+        # ── LIVE GAME FINISHED — show final results button ───────────────────
+        elif live and live.get('finished'):
+            lg = live
+            st.subheader(f"🏀 Final: {lg['my_team_abbr']} {lg['my_score']} — {lg['opp_team_abbr']} {lg['opp_score']}")
+
+            # Quarter scores
+            if lg['quarter_scores']:
+                q_cols = st.columns(len(lg['quarter_scores']) + 1)
+                for qi, (mq, oq) in enumerate(lg['quarter_scores']):
+                    ql = f"OT{qi - 3}" if qi >= 4 else f"Q{qi + 1}"
+                    q_cols[qi].caption(f"**{ql}**\n{mq} - {oq}")
+                q_cols[-1].caption(f"**Total**\n{lg['my_score']} - {lg['opp_score']}")
+
+            # Full play-by-play
+            with st.expander("Full play-by-play"):
+                for event in lg['play_by_play']:
+                    st.text(event)
+
+            if st.button("📊 View Final Results & Continue", type="primary"):
+                my_score, opp_score, box_score, injury_reports, sub_reports, opp_name = finalize_live_game(lg)
+                res = "W" if my_score > opp_score else "L"
+                st.session_state.results.append(res)
+                post_game_updates([], [], roster)
+
+                # Season points
+                for p in box_score:
+                    if int(p['PLAYER_ID']) == 0:
+                        continue
+                    st.session_state.season_pts[p['Player']] = (
+                        st.session_state.season_pts.get(p['Player'], 0) + p['Points']
+                    )
+
+                played_opp_id = lg['opponent_id']
+                st.session_state.last_game_result = {
+                    'final_score': my_score, 'final_opp': opp_score,
+                    'res': res, 'box_score': box_score,
+                    'injury_reports': injury_reports, 'sub_reports': sub_reports,
+                    'opp_name': opp_name, 'played_opp_id': played_opp_id,
+                }
+                if res == 'W':
+                    st.session_state.show_balloons = True
+
+                # Update standings if regular season
+                if season_phase == 'regular' and games_played < 82:
+                    matchups = generate_round_matchups(all_teams, games_played)
+                    other_results = simulate_other_games(matchups, current_team_id, all_stats)
+                    opp_res = 'L' if res == 'W' else 'W'
+                    all_results = {current_team_id: res, played_opp_id: opp_res, **other_results}
+                    update_standings(st.session_state.standings, all_results)
+                    st.session_state.games_played += 1
+                    if st.session_state.games_played >= 82:
+                        st.session_state.season_phase = 'playoffs_pending'
+                elif season_phase == 'playoffs_user':
+                    series = st.session_state.current_series
+                    bracket = st.session_state.playoff_bracket
+                    if series:
+                        if res == 'W':
+                            series['user_wins'] += 1
+                        else:
+                            series['opp_wins'] += 1
+                        if series['user_wins'] == 4 or series['opp_wins'] == 4:
+                            user_won = series['user_wins'] == 4
+                            _finish_user_series(bracket, series, current_team_id, user_won, all_stats)
+                        else:
+                            st.session_state.current_series = series
+
+                st.session_state.live_game = None
+                st.session_state.batch_results = None
+                save_state()
+                st.rerun()
+
+        # ── NO LIVE GAME — normal lineup/sim flow ────────────────────────────
+        else:
+            injured_names = list(st.session_state.injured_list.keys())
+            healthy_roster = roster[~roster['PLAYER'].isin(injured_names)].sort_values('PTS', ascending=False)
+
+            st.subheader("Pick Your Lineup")
+            st.caption("Check up to 5 players to start. Top 5 scorers are pre-selected.")
+
+            suggested = healthy_roster.nlargest(5, 'PTS')['PLAYER'].tolist()
+            starters = []
+            card_cols = st.columns(5)
+            for i, (_, row) in enumerate(healthy_roster.head(10).iterrows()):
+                col = card_cols[i % 5]
+                pos = row.get('POSITION', '?') or '?'
+                col.image(player_img_url(int(row['PLAYER_ID'])), width=90)
+                selected = col.checkbox(
+                    row['PLAYER'],
+                    value=row['PLAYER'] in suggested,
+                    key=f"starter_{row['PLAYER']}",
+                )
+                col.caption(
+                    f"`{pos}` · OVR {overall_badge(int(row['OVERALL']))}  \n"
+                    f"{row['PTS']:.1f} PPG · {fmt_salary(row['SALARY'])}"
+                )
+                if selected:
+                    starters.append(row['PLAYER'])
+
+            n = len(starters)
+            if n > 0:
+                starter_sal = roster[roster['PLAYER'].isin(starters)]['SALARY'].sum()
+                status = f"{n}/5 selected · {fmt_salary(starter_sal)}"
+                if n == 5 and starter_sal > SALARY_CAP:
+                    st.warning(f"⚠️ Cap Violation — {status}")
+                elif n == 5:
+                    st.success(f"✅ Lineup locked — {status}")
+                else:
+                    st.info(f"{status}")
+
+            st.subheader("📋 Game Plan")
+            tactic = st.radio("Select Strategy:", ["Balanced", "Pace & Space", "Grit & Grind"], horizontal=True)
+            st.caption({
+                "Balanced": "1.0× offense and defense.",
+                "Pace & Space": "1.2× your score, 1.1× opponent score. High-risk, high-reward.",
+                "Grit & Grind": "0.9× your score, 0.8× opponent score. Defensive identity, more stamina drain.",
+            }[tactic])
+
+            if season_phase == 'playoffs_spectate':
+                st.info("🏁 Your season is over. Watch the playoffs unfold from the **Standings** tab.")
+                bracket = st.session_state.playoff_bracket
+                if bracket and not bracket.get('champion'):
+                    if st.button("📺 Simulate Next Playoff Round"):
+                        _sim_playoff_round(bracket, all_stats)
+                        save_state()
+                        st.rerun()
+
+            elif season_phase == 'playoffs_user':
+                series = st.session_state.current_series
+                bracket = st.session_state.playoff_bracket
+                if series and bracket and not bracket.get('champion') and series['user_wins'] < 4 and series['opp_wins'] < 4:
+                    opp_id = series['opponent_id']
+                    opp_info = next((t for t in all_teams if t['id'] == opp_id), None)
+                    round_labels = {'round1': 'First Round', 'round2': 'Semifinals',
+                                    'conf_finals': 'Conference Finals', 'finals': 'NBA Finals'}
+                    st.subheader(f"🏀 {round_labels.get(series['round'], 'Playoffs')}")
+                    if opp_info:
+                        lc, mc = st.columns([1, 4])
+                        lc.image(team_logo_url(opp_id), width=70)
+                        mc.write(f"**vs {opp_info['full_name']}**")
+                        mc.write(f"Series: {my_team['abbreviation']} **{series['user_wins']}** — "
+                                 f"**{series['opp_wins']}** {opp_info['abbreviation']}")
+
+                    pl_col1, pl_col2 = st.columns(2)
+                    sim_playoff = pl_col1.button("🏟️ Sim Playoff Game")
+                    live_playoff = pl_col2.button("🎮 Play Live Playoff Game")
+
+                    if sim_playoff or live_playoff:
+                        if len(starters) != 5:
+                            st.error("Select exactly 5 starters.")
+                        elif live_playoff:
+                            lineup_df = roster[roster['PLAYER'].isin(starters)]
+                            lg = init_live_game(lineup_df, roster, all_stats, all_teams,
+                                                current_team_id, series['opponent_id'], tactic,
+                                                difficulty=difficulty)
+                            st.session_state.live_game = lg
+                            save_state()
+                            st.rerun()
+                        else:
+                            lineup_df = roster[roster['PLAYER'].isin(starters)]
+                            if hard:
+                                p_mod = 1.1 if tactic == "Pace & Space" else 0.85 if tactic == "Grit & Grind" else 1.0
+                                o_mod = 1.1 if tactic == "Pace & Space" else 0.85 if tactic == "Grit & Grind" else 1.0
+                            else:
+                                p_mod = 1.2 if tactic == "Pace & Space" else 0.9 if tactic == "Grit & Grind" else 1.0
+                                o_mod = 1.1 if tactic == "Pace & Space" else 0.8 if tactic == "Grit & Grind" else 1.0
+
+                            score, opp_score, box_score, injury_reports, sub_reports, opp_name = simulate_game(
+                                lineup_df, roster, tactic, all_stats, all_teams,
+                                current_team_id, [],
+                                opponent_team_id=series['opponent_id'],
+                                difficulty=difficulty,
+                            )
+                            final_score = int(score * p_mod)
+                            final_opp = int(opp_score * o_mod)
+                            res = "W" if final_score > final_opp else "L"
+
+                            starter_names_list = lineup_df['PLAYER'].tolist()
+                            post_game_updates(starter_names_list, [], roster)
+
+                            if res == 'W':
+                                series['user_wins'] += 1
+                            else:
+                                series['opp_wins'] += 1
+
+                            st.session_state.last_game_result = {
+                                'final_score': final_score, 'final_opp': final_opp,
+                                'res': res, 'box_score': box_score,
+                                'injury_reports': injury_reports, 'sub_reports': sub_reports,
+                                'opp_name': opp_name, 'played_opp_id': series['opponent_id'],
+                            }
+                            if res == 'W':
+                                st.session_state.show_balloons = True
+
+                            # Check if series is over
+                            if series['user_wins'] == 4 or series['opp_wins'] == 4:
+                                user_won = series['user_wins'] == 4
+                                _finish_user_series(bracket, series, current_team_id, user_won,
+                                                    all_stats)
+                            else:
+                                st.session_state.current_series = series
+
+                            save_state()
+                            st.rerun()
+                else:
+                    if bracket and bracket.get('champion'):
+                        champ = next((t for t in all_teams if t['id'] == bracket['champion']), None)
+                        champ_name = champ['full_name'] if champ else '?'
+                        if bracket['champion'] == current_team_id:
+                            st.success(f"🏆 Congratulations! You are the NBA Champions!")
+                        else:
+                            st.info(f"🏆 The **{champ_name}** are your NBA Champions. Check the **Bracket** tab.")
+                    else:
+                        st.info("Check the **Bracket** tab for playoff results.")
+
+            elif games_played >= 82:
+                st.info("🏁 Regular season is complete! Head to **Standings** to see playoff picture.")
+            else:
+                remaining = 82 - games_played
+                live_col, sim_col1, sim_col2, sim_col3 = st.columns(4)
+                live_btn = live_col.button("🎮 Play Live", key="play_live",
+                                           disabled=remaining < 1)
+                sim_1 = sim_col1.button("🏟️ Sim 1 Game", key="sim_1",
+                                         disabled=remaining < 1)
+                sim_5 = sim_col2.button("⏩ Sim 5 Games", key="sim_5",
+                                         disabled=remaining < 1)
+                sim_10 = sim_col3.button("⏭️ Sim 10 Games", key="sim_10",
+                                          disabled=remaining < 1)
+
+                if live_btn:
+                    if len(starters) != 5:
+                        st.error("Select exactly 5 starters.")
+                    else:
+                        lineup_df = roster[roster['PLAYER'].isin(starters)]
+                        gp = st.session_state.games_played
+                        matchups = generate_round_matchups(all_teams, gp)
+                        opp_id, _ = find_user_matchup(matchups, current_team_id)
+                        lg = init_live_game(lineup_df, roster, all_stats, all_teams,
+                                            current_team_id, opp_id, tactic,
+                                            difficulty=difficulty)
+                        st.session_state.live_game = lg
+                        save_state()
+                        st.rerun()
+
+                num_games = 0
+                if sim_1: num_games = min(1, remaining)
+                elif sim_5: num_games = min(5, remaining)
+                elif sim_10: num_games = min(10, remaining)
+
+                if num_games > 0:
+                    if len(starters) != 5:
+                        st.error("Select exactly 5 starters to continue.")
+                    else:
+                        if hard:
+                            p_mod = 1.1 if tactic == "Pace & Space" else 0.85 if tactic == "Grit & Grind" else 1.0
+                            o_mod = 1.1 if tactic == "Pace & Space" else 0.85 if tactic == "Grit & Grind" else 1.0
+                        else:
+                            p_mod = 1.2 if tactic == "Pace & Space" else 0.9 if tactic == "Grit & Grind" else 1.0
+                            o_mod = 1.1 if tactic == "Pace & Space" else 0.8 if tactic == "Grit & Grind" else 1.0
+                        batch_results = []
+
+                        for game_i in range(num_games):
+                            gp = st.session_state.games_played
+                            if gp >= 82:
+                                break
+
+                            # Game 0 uses manual lineup; subsequent games auto-select
+                            if game_i == 0:
+                                lineup_df = roster[roster['PLAYER'].isin(starters)]
+                                current_rested = []
+                            else:
+                                lineup_df, current_rested = auto_select_lineup(
+                                    roster, st.session_state.injured_list
+                                )
+
+                            # Get schedule-based opponent
+                            matchups = generate_round_matchups(all_teams, gp)
+                            opp_id, _ = find_user_matchup(matchups, current_team_id)
+
+                            score, opp_score, box_score, injury_reports, sub_reports, opp_name = simulate_game(
+                                lineup_df, roster, tactic, all_stats, all_teams,
+                                current_team_id, current_rested,
+                                opponent_team_id=opp_id,
+                                difficulty=difficulty,
+                            )
+
+                            final_score = int(score * p_mod)
+                            final_opp = int(opp_score * o_mod)
+                            res = "W" if final_score > final_opp else "L"
+                            st.session_state.results.append(res)
+
+                            starter_names = lineup_df['PLAYER'].tolist()
+                            post_game_updates(starter_names, current_rested, roster)
+
+                            # Accumulate season points
+                            for p in box_score:
+                                if int(p['PLAYER_ID']) == 0:
+                                    continue
+                                clean_name = p['Player'].split(" (sub")[0].replace("↔ ", "").strip()
+                                if " (sub for " in clean_name:
+                                    clean_name = clean_name.split(" (sub for ")[0]
+                                st.session_state.season_pts[clean_name] = (
+                                    st.session_state.season_pts.get(clean_name, 0) + p['Points']
+                                )
+
+                            # Sim the other 14 matchups in this round
+                            other_results = simulate_other_games(matchups, current_team_id, all_stats)
+                            # Build full round results for standings
+                            opp_res = 'L' if res == 'W' else 'W'
+                            all_results = {current_team_id: res, opp_id: opp_res, **other_results}
+                            update_standings(st.session_state.standings, all_results)
+
+                            st.session_state.games_played += 1
+
+                            batch_results.append({
+                                'final_score': final_score,
+                                'final_opp': final_opp,
+                                'res': res,
+                                'box_score': box_score,
+                                'injury_reports': injury_reports,
+                                'sub_reports': sub_reports,
+                                'opp_name': opp_name,
+                                'played_opp_id': opp_id,
+                            })
+
+                        # Store the last game for detailed display and batch summary
+                        if batch_results:
+                            st.session_state.last_game_result = batch_results[-1]
+                            st.session_state.batch_results = batch_results
+                            batch_w = sum(1 for g in batch_results if g['res'] == 'W')
+                            if batch_w == len(batch_results):
+                                st.session_state.show_balloons = True
+
+                            # Check if season just ended
+                            if st.session_state.games_played >= 82:
+                                st.session_state.season_phase = 'playoffs_pending'
+
+                            save_state()
+                            st.rerun()
+
+            # ── Last game result (rendered from session state after rerun) ─────────
+            if st.session_state.get('show_balloons'):
+                st.balloons()
+                st.session_state.show_balloons = False
+
+            # Batch summary (if multiple games were simmed)
+            batch = st.session_state.get('batch_results')
+            if batch and len(batch) > 1:
+                batch_w = sum(1 for g in batch if g['res'] == 'W')
+                batch_l = len(batch) - batch_w
+                st.subheader(f"Batch Results: {batch_w}W — {batch_l}L in {len(batch)} games")
+                with st.expander("Game-by-game scores"):
+                    for i, g in enumerate(batch):
+                        icon = "✅" if g['res'] == 'W' else "❌"
+                        st.write(f"{icon} Game {games_played - len(batch) + i + 1}: "
+                                 f"{my_team['abbreviation']} {g['final_score']} — "
+                                 f"{g['opp_name']} {g['final_opp']}")
+                st.caption("Detailed box score shown for the last game:")
+
+            r = st.session_state.get('last_game_result')
+            if r:
+                sc_my, sc_vs, sc_opp = st.columns([3, 1, 3])
+                with sc_my:
+                    lc, mc = st.columns([1, 2])
+                    lc.image(team_logo_url(current_team_id), width=70)
+                    mc.metric(my_team['abbreviation'], r['final_score'],
+                              delta=r['final_score'] - r['final_opp'])
+                sc_vs.markdown(
+                    "<div style='text-align:center;padding-top:16px;font-size:1.2rem;font-weight:bold'>FINAL</div>",
+                    unsafe_allow_html=True,
+                )
+                with sc_opp:
+                    lc, mc = st.columns([1, 2])
+                    if r['played_opp_id']:
+                        lc.image(team_logo_url(r['played_opp_id']), width=70)
+                    mc.metric(r['opp_name'], r['final_opp'])
+
+                for ir in r['injury_reports']:
+                    st.warning(f"🚑 {ir}")
+                for sr in r['sub_reports']:
+                    st.info(sr)
+
+                st.subheader("Box Score")
+                hdr = st.columns([1, 3, 1, 1, 2])
+                hdr[0].write("**Photo**")
+                hdr[1].write("**Player**")
+                hdr[2].write("**Pos**")
+                hdr[3].write("**PTS**")
+                hdr[4].write("**Stamina**")
+                st.divider()
+                for p in r['box_score']:
+                    rc = st.columns([1, 3, 1, 1, 2])
+                    pid = int(p['PLAYER_ID'])
+                    if pid == 0:
+                        rc[0].write("🪑")
+                    else:
+                        rc[0].image(player_img_url(pid), width=50)
+                    rc[1].write(p['Player'])
+                    p_row = all_stats[all_stats['PLAYER_ID'] == p['PLAYER_ID']]
+                    pos = p_row.iloc[0].get('POSITION', '?') if not p_row.empty else '—'
+                    rc[2].write(f"`{pos or '?'}`")
+                    rc[3].write(str(p['Points']))
+                    stam = p['Stamina Left']
+                    icon = "🟢" if stam >= 60 else "🟡" if stam >= 30 else "🔴"
+                    rc[4].write(f"{icon} {stam}%")
 
     # ── TRADE DESK ────────────────────────────────────────────────────────────
     with tab_trade:
@@ -842,7 +1048,7 @@ else:
                 my_trade_df = roster[roster['PLAYER'].isin(my_names)]
                 their_trade_df = partner_roster[partner_roster['PLAYER'].isin(their_names)]
 
-                accepted, my_pts, their_pts, my_sal, their_sal = evaluate_trade(my_trade_df, their_trade_df)
+                accepted, my_pts, their_pts, my_sal, their_sal = evaluate_trade(my_trade_df, their_trade_df, difficulty)
 
                 salary_limit = my_sal * 1.25 + 100_000
                 st.write(
@@ -870,6 +1076,11 @@ else:
                             f"Received: {', '.join(their_names)} (from {partner_name})"
                         )
                         st.session_state.trade_history.insert(0, trade_str)
+                        # Hard mode: chemistry disruption penalty
+                        if hard:
+                            st.session_state.trade_cooldown = max(
+                                st.session_state.get('trade_cooldown', 0), 5
+                            )
                         save_state()
                         st.success(f"Trade complete! {trade_str}")
                         st.rerun()
@@ -1036,7 +1247,6 @@ else:
                         st.session_state.results = []
                         st.session_state.season_pts = {}
                         st.session_state.injured_list = {}
-                        st.session_state.stamina = {}
                         st.session_state.standings = {t['id']: {'w': 0, 'l': 0} for t in all_teams}
                         st.session_state.games_played = 0
                         st.session_state.season_phase = 'regular'
@@ -1044,8 +1254,275 @@ else:
                         st.session_state.current_series = None
                         st.session_state.last_game_result = None
                         st.session_state.batch_results = None
+                        st.session_state.season_stamina = {}
+                        st.session_state.trade_cooldown = 0
                         save_state()
                         st.rerun()
+
+    # ── PLAYOFF BRACKET ──────────────────────────────────────────────────────
+    with tab_bracket:
+        bracket = st.session_state.playoff_bracket
+        standings = st.session_state.standings
+
+        if not bracket:
+            st.info("The playoff bracket will appear here once the regular season is complete (82 games).")
+        else:
+            team_map_by_id = {t['id']: t for t in all_teams}
+
+            def _bracket_cell(tid, series_data=None, seed=None, is_winner=False, is_loser=False):
+                """Generate HTML for one team cell in the bracket."""
+                if tid is None:
+                    return '<div class="bracket-team bracket-tbd">TBD</div>'
+                info = team_map_by_id.get(tid, {})
+                abbr = info.get('abbreviation', '?')
+                logo = team_logo_url(tid)
+                rec = standings.get(tid, {'w': 0, 'l': 0})
+                record = f"{rec['w']} - {rec['l']}"
+                wins = ''
+                if series_data:
+                    w = series_data['wins_a'] if series_data['a'] == tid else series_data['wins_b']
+                    wins = f'<span class="bracket-wins">{w}</span>'
+                seed_str = f'<span class="bracket-seed">{seed}</span>' if seed else ''
+                cls = 'bracket-team'
+                if is_winner:
+                    cls += ' bracket-winner'
+                if is_loser:
+                    cls += ' bracket-loser'
+                if tid == current_team_id:
+                    cls += ' bracket-user'
+                return (
+                    f'<div class="{cls}">'
+                    f'  <img src="{logo}" class="bracket-logo">'
+                    f'  {seed_str}'
+                    f'  <span class="bracket-name">{abbr}</span>'
+                    f'  <span class="bracket-record">{record}</span>'
+                    f'  {wins}'
+                    f'</div>'
+                )
+
+            def _matchup_html(a_id, b_id, bracket, seed_a=None, seed_b=None):
+                """Generate HTML for a single matchup box."""
+                key = f"{a_id}v{b_id}"
+                s = bracket['series'].get(key, {})
+                winner = s.get('winner')
+                a_winner = winner == a_id if winner else False
+                b_winner = winner == b_id if winner else False
+                a_loser = winner is not None and not a_winner
+                b_loser = winner is not None and not b_winner
+                return (
+                    f'<div class="bracket-matchup">'
+                    f'  {_bracket_cell(a_id, s, seed_a, a_winner, a_loser)}'
+                    f'  {_bracket_cell(b_id, s, seed_b, b_winner, b_loser)}'
+                    f'</div>'
+                )
+
+            def _tbd_matchup():
+                return (
+                    '<div class="bracket-matchup">'
+                    '  <div class="bracket-team bracket-tbd">TBD</div>'
+                    '  <div class="bracket-team bracket-tbd">TBD</div>'
+                    '</div>'
+                )
+
+            # Compute seeds per conference
+            conf_seeds = {}
+            for conf in ('East', 'West'):
+                conf_teams = [tid for tid in standings if CONFERENCE.get(tid) == conf]
+                conf_teams.sort(
+                    key=lambda t: (
+                        standings[t]['w'] / max(standings[t]['w'] + standings[t]['l'], 1),
+                        standings[t]['w'],
+                    ),
+                    reverse=True,
+                )
+                for i, tid in enumerate(conf_teams[:8], 1):
+                    conf_seeds[tid] = i
+
+            # Build bracket HTML for each conference
+            bracket_css = """
+            <style>
+            .bracket-container {
+                display: flex;
+                align-items: center;
+                gap: 24px;
+                overflow-x: auto;
+                padding: 16px 0;
+            }
+            .bracket-round {
+                display: flex;
+                flex-direction: column;
+                gap: 24px;
+                justify-content: center;
+                min-width: 180px;
+            }
+            .bracket-round-r2 { gap: 72px; }
+            .bracket-round-cf { gap: 168px; }
+            .bracket-round-label {
+                text-align: center;
+                font-weight: bold;
+                font-size: 0.85rem;
+                color: #888;
+                margin-bottom: 8px;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            .bracket-matchup {
+                border: 1px solid #444;
+                border-radius: 6px;
+                overflow: hidden;
+                background: #1a1a2e;
+            }
+            .bracket-team {
+                display: flex;
+                align-items: center;
+                padding: 6px 10px;
+                gap: 8px;
+                font-size: 0.9rem;
+                border-bottom: 1px solid #333;
+                min-height: 38px;
+            }
+            .bracket-team:last-child { border-bottom: none; }
+            .bracket-tbd {
+                color: #555;
+                font-style: italic;
+                justify-content: center;
+            }
+            .bracket-winner {
+                background: #1b3a2a;
+                font-weight: bold;
+            }
+            .bracket-loser {
+                opacity: 0.45;
+            }
+            .bracket-user .bracket-name {
+                color: #4da6ff;
+                font-weight: bold;
+            }
+            .bracket-logo {
+                width: 24px;
+                height: 24px;
+                object-fit: contain;
+            }
+            .bracket-seed {
+                color: #888;
+                font-size: 0.75rem;
+                min-width: 14px;
+            }
+            .bracket-name {
+                font-weight: 600;
+                min-width: 36px;
+            }
+            .bracket-record {
+                color: #999;
+                font-size: 0.8rem;
+                margin-left: auto;
+            }
+            .bracket-wins {
+                background: #333;
+                color: #fff;
+                border-radius: 4px;
+                padding: 1px 6px;
+                font-size: 0.8rem;
+                font-weight: bold;
+                min-width: 18px;
+                text-align: center;
+            }
+            .bracket-winner .bracket-wins {
+                background: #2d7a4a;
+            }
+            .bracket-champion {
+                text-align: center;
+                padding: 16px;
+                border: 2px solid #ffd700;
+                border-radius: 8px;
+                background: linear-gradient(135deg, #1a1a2e 0%, #2a1a0e 100%);
+            }
+            .bracket-champion img {
+                width: 64px;
+                height: 64px;
+                object-fit: contain;
+            }
+            .bracket-finals-label {
+                text-align: center;
+                font-size: 1.1rem;
+                font-weight: bold;
+                color: #ffd700;
+                margin-bottom: 12px;
+            }
+            </style>
+            """
+            st.markdown(bracket_css, unsafe_allow_html=True)
+
+            for conf in ('West', 'East'):
+                conf_label = 'Western Conference' if conf == 'West' else 'Eastern Conference'
+                st.markdown(f"### {conf_label}")
+                conf_data = bracket[conf]
+
+                # Round 1 matchups
+                r1 = conf_data.get('round1', [])
+                r1_html = ''
+                for a_id, b_id in r1:
+                    r1_html += _matchup_html(a_id, b_id, bracket, conf_seeds.get(a_id), conf_seeds.get(b_id))
+
+                # Round 2 matchups
+                r2 = conf_data.get('round2', [])
+                r2_html = ''
+                if r2:
+                    for a_id, b_id in r2:
+                        r2_html += _matchup_html(a_id, b_id, bracket, conf_seeds.get(a_id), conf_seeds.get(b_id))
+                else:
+                    r2_html = _tbd_matchup() + _tbd_matchup()
+
+                # Conference Finals
+                cf = conf_data.get('conf_finals', [])
+                cf_html = ''
+                if cf:
+                    for a_id, b_id in cf:
+                        cf_html += _matchup_html(a_id, b_id, bracket, conf_seeds.get(a_id), conf_seeds.get(b_id))
+                else:
+                    cf_html = _tbd_matchup()
+
+                html = (
+                    f'<div class="bracket-container">'
+                    f'  <div class="bracket-round">'
+                    f'    <div class="bracket-round-label">First Round</div>'
+                    f'    {r1_html}'
+                    f'  </div>'
+                    f'  <div class="bracket-round bracket-round-r2">'
+                    f'    <div class="bracket-round-label">Semifinals</div>'
+                    f'    {r2_html}'
+                    f'  </div>'
+                    f'  <div class="bracket-round bracket-round-cf">'
+                    f'    <div class="bracket-round-label">Conf Finals</div>'
+                    f'    {cf_html}'
+                    f'  </div>'
+                    f'</div>'
+                )
+                st.markdown(html, unsafe_allow_html=True)
+                st.divider()
+
+            # NBA Finals
+            if bracket.get('finals'):
+                st.markdown('<div class="bracket-finals-label">NBA Finals</div>', unsafe_allow_html=True)
+                a_id, b_id = bracket['finals']
+                finals_html = _matchup_html(a_id, b_id, bracket, None, None)
+                st.markdown(
+                    f'<div style="display:flex;justify-content:center;">{finals_html}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            if bracket.get('champion'):
+                champ = team_map_by_id.get(bracket['champion'], {})
+                st.markdown(
+                    f'<div class="bracket-champion">'
+                    f'  <img src="{team_logo_url(bracket["champion"])}">'
+                    f'  <div style="font-size:1.3rem;font-weight:bold;color:#ffd700;margin-top:8px;">'
+                    f'    🏆 {champ.get("full_name", "?")} 🏆'
+                    f'  </div>'
+                    f'  <div style="color:#ccc;">NBA Champions</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
     # ── SEASON STATS ──────────────────────────────────────────────────────────
     with tab_stats:
