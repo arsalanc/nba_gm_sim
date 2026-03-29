@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import json
+# import json  # Re-enable if restoring file persistence in save_state/load_state
 import os
 import tempfile
 from nba_api.stats.static import teams
@@ -115,24 +115,26 @@ def overall_badge(ovr):
 
 # --- PERSISTENCE ---
 def save_state():
-    keys = ['my_team_id', 'difficulty', 'results', 'season_pts', 'injured_list',
-            'my_roster_overrides', 'trade_history',
-            'standings', 'games_played', 'season_phase', 'playoff_bracket',
-            'current_series', 'live_game', 'season_stamina', 'trade_cooldown']
-    state = {k: st.session_state.get(k) for k in keys}
-    with open(SAVE_FILE, 'w') as f:
-        json.dump(state, f)
+    pass  # File persistence disabled — each session is isolated (safe for multi-user cloud hosting)
+    # keys = ['my_team_id', 'difficulty', 'results', 'season_pts', 'injured_list',
+    #         'my_roster_overrides', 'trade_history',
+    #         'standings', 'games_played', 'season_phase', 'playoff_bracket',
+    #         'current_series', 'live_game', 'season_stamina', 'trade_cooldown']
+    # state = {k: st.session_state.get(k) for k in keys}
+    # with open(SAVE_FILE, 'w') as f:
+    #     json.dump(state, f)
 
 def load_state():
-    if os.path.exists(SAVE_FILE):
-        with open(SAVE_FILE) as f:
-            data = json.load(f)
-        # JSON converts int keys to strings — convert standings keys back to int
-        if 'standings' in data and isinstance(data['standings'], dict):
-            data['standings'] = {int(k): v for k, v in data['standings'].items()}
-        for k, v in data.items():
-            if k not in st.session_state:
-                st.session_state[k] = v
+    pass  # File persistence disabled — each session is isolated (safe for multi-user cloud hosting)
+    # if os.path.exists(SAVE_FILE):
+    #     with open(SAVE_FILE) as f:
+    #         data = json.load(f)
+    #     # JSON converts int keys to strings — convert standings keys back to int
+    #     if 'standings' in data and isinstance(data['standings'], dict):
+    #         data['standings'] = {int(k): v for k, v in data['standings'].items()}
+    #     for k, v in data.items():
+    #         if k not in st.session_state:
+    #             st.session_state[k] = v
 
 
 # --- DATA ---
