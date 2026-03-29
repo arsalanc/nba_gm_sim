@@ -202,7 +202,7 @@ else:
     # ── SEASON STATS ──────────────────────────────────────────────────────────
     with tab_stats:
         from tabs.season_stats import render as render_season_stats
-        render_season_stats(all_stats, w, l)
+        render_season_stats(all_stats, w, l, all_teams)
 
     # ── HOW TO PLAY ───────────────────────────────────────────────────────────
     with tab_howto:

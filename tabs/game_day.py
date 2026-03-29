@@ -209,39 +209,6 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
         injured_names = list(st.session_state.injured_list.keys())
         healthy_roster = roster[~roster['PLAYER'].isin(injured_names)].sort_values('PTS', ascending=False)
 
-        st.subheader("Pick Your Lineup")
-        st.caption("Check up to 5 players to start. Top 5 scorers are pre-selected.")
-
-        suggested = healthy_roster.nlargest(5, 'PTS')['PLAYER'].tolist()
-        starters = []
-        card_cols = st.columns(5)
-        for i, (_, row) in enumerate(healthy_roster.head(10).iterrows()):
-            col = card_cols[i % 5]
-            pos = row.get('POSITION', '?') or '?'
-            col.image(player_img_url(int(row['PLAYER_ID'])), width=90)
-            selected = col.checkbox(
-                row['PLAYER'],
-                value=row['PLAYER'] in suggested,
-                key=f"starter_{row['PLAYER']}",
-            )
-            col.caption(
-                f"`{pos}` · OVR {overall_badge(int(row['OVERALL']))}  \n"
-                f"{row['PTS']:.1f} PPG · {fmt_salary(row['SALARY'])}"
-            )
-            if selected:
-                starters.append(row['PLAYER'])
-
-        n = len(starters)
-        if n > 0:
-            starter_sal = roster[roster['PLAYER'].isin(starters)]['SALARY'].sum()
-            status = f"{n}/5 selected · {fmt_salary(starter_sal)}"
-            if n == 5 and starter_sal > SALARY_CAP:
-                st.warning(f"⚠️ Cap Violation — {status}")
-            elif n == 5:
-                st.success(f"✅ Lineup locked — {status}")
-            else:
-                st.info(f"{status}")
-
         st.subheader("📋 Game Plan")
         tactic = st.radio("Select Strategy:", ["Balanced", "Pace & Space", "Grit & Grind"], horizontal=True)
         st.caption({
@@ -249,6 +216,9 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
             "Pace & Space": "1.2× your score, 1.1× opponent score. High-risk, high-reward.",
             "Grit & Grind": "0.9× your score, 0.8× opponent score. Defensive identity, more stamina drain.",
         }[tactic])
+
+        # current_starters is pre-computed by app.py from checkbox widget state before tabs render
+        _cur_starters = st.session_state.current_starters
 
         if season_phase == 'playoffs_spectate':
             st.info("🏁 Your season is over. Watch the playoffs unfold from the **Standings** tab.")
@@ -280,10 +250,10 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                 live_playoff = pl_col2.button("🎮 Play Live Playoff Game")
 
                 if sim_playoff or live_playoff:
-                    if len(starters) != 5:
+                    if len(_cur_starters) != 5:
                         st.error("Select exactly 5 starters.")
                     elif live_playoff:
-                        lineup_df = roster[roster['PLAYER'].isin(starters)]
+                        lineup_df = roster[roster['PLAYER'].isin(_cur_starters)]
                         lg = init_live_game(lineup_df, roster, all_stats, all_teams,
                                             current_team_id, series['opponent_id'], tactic,
                                             difficulty=difficulty)
@@ -291,7 +261,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                         save_state()
                         st.rerun()
                     else:
-                        lineup_df = roster[roster['PLAYER'].isin(starters)]
+                        lineup_df = roster[roster['PLAYER'].isin(_cur_starters)]
                         if hard:
                             p_mod = 1.1 if tactic == "Pace & Space" else 0.85 if tactic == "Grit & Grind" else 1.0
                             o_mod = 1.1 if tactic == "Pace & Space" else 0.85 if tactic == "Grit & Grind" else 1.0
@@ -361,10 +331,10 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                                       disabled=remaining < 1)
 
             if live_btn:
-                if len(starters) != 5:
+                if len(_cur_starters) != 5:
                     st.error("Select exactly 5 starters.")
                 else:
-                    lineup_df = roster[roster['PLAYER'].isin(starters)]
+                    lineup_df = roster[roster['PLAYER'].isin(_cur_starters)]
                     gp = st.session_state.games_played
                     matchups = generate_round_matchups(all_teams, gp)
                     opp_id, _ = find_user_matchup(matchups, current_team_id)
@@ -381,7 +351,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
             elif sim_10: num_games = min(10, remaining)
 
             if num_games > 0:
-                if len(starters) != 5:
+                if len(_cur_starters) != 5:
                     st.error("Select exactly 5 starters to continue.")
                 else:
                     if hard:
@@ -399,7 +369,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
 
                         # Game 0 uses manual lineup; subsequent games auto-select
                         if game_i == 0:
-                            lineup_df = roster[roster['PLAYER'].isin(starters)]
+                            lineup_df = roster[roster['PLAYER'].isin(_cur_starters)]
                             current_rested = []
                         else:
                             lineup_df, current_rested = auto_select_lineup(
@@ -470,6 +440,40 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
 
                         save_state()
                         st.rerun()
+
+        st.divider()
+        st.subheader("🏀 Pick Your Lineup")
+        st.caption("Check up to 5 players to start. Top 5 scorers are pre-selected.")
+
+        suggested = healthy_roster.nlargest(5, 'PTS')['PLAYER'].tolist()
+        starters = []
+        card_cols = st.columns(5)
+        for i, (_, row) in enumerate(healthy_roster.head(10).iterrows()):
+            col = card_cols[i % 5]
+            pos = row.get('POSITION', '?') or '?'
+            col.image(player_img_url(int(row['PLAYER_ID'])), width=90)
+            selected = col.checkbox(
+                row['PLAYER'],
+                value=row['PLAYER'] in suggested,
+                key=f"starter_{row['PLAYER']}",
+            )
+            col.caption(
+                f"`{pos}` · OVR {overall_badge(int(row['OVERALL']))}  \n"
+                f"{row['PTS']:.1f} PPG · {fmt_salary(row['SALARY'])}"
+            )
+            if selected:
+                starters.append(row['PLAYER'])
+
+        n = len(starters)
+        if n > 0:
+            starter_sal = roster[roster['PLAYER'].isin(starters)]['SALARY'].sum()
+            status = f"{n}/5 selected · {fmt_salary(starter_sal)}"
+            if n == 5 and starter_sal > SALARY_CAP:
+                st.warning(f"⚠️ Cap Violation — {status}")
+            elif n == 5:
+                st.success(f"✅ Lineup locked — {status}")
+            else:
+                st.info(f"{status}")
 
         # ── Last game result (rendered from session state after rerun) ─────────
         if st.session_state.get('show_balloons'):

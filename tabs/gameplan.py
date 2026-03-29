@@ -1,6 +1,7 @@
 import streamlit as st
+import plotly.graph_objects as go
 
-from utils import player_img_url, team_logo_url, overall_badge
+from utils import player_img_url, team_logo_url, overall_badge, compute_team_strength
 from engine import generate_round_matchups, find_user_matchup
 
 
@@ -149,3 +150,57 @@ def render(my_team, current_team_id, roster, all_teams, all_stats, season_phase,
 
             for line in advice_lines:
                 st.markdown(line)
+
+            # ── Opponent Strength Schedule ────────────────────────────────
+            if season_phase == 'regular' and games_played < season_length:
+                remaining = season_length - games_played
+                lookahead = min(remaining, 15)
+                if lookahead >= 2:
+                    st.divider()
+                    st.subheader("📅 Upcoming Schedule")
+                    st.caption(f"Next {lookahead} opponents by strength (OVR of their top 8 players)")
+
+                    sched_teams, sched_ovrs, sched_colors = [], [], []
+                    my_strength = compute_team_strength(current_team_id, all_stats)
+                    team_map_id = {t['id']: t for t in all_teams}
+
+                    for g in range(games_played, games_played + lookahead):
+                        matchups = generate_round_matchups(all_teams, g)
+                        opp_id, _ = find_user_matchup(matchups, current_team_id)
+                        if opp_id is None:
+                            continue
+                        opp_str = compute_team_strength(opp_id, all_stats)
+                        opp_abbr = team_map_id.get(opp_id, {}).get('abbreviation', '?')
+                        diff = opp_str - my_strength
+                        color = '#e05252' if diff > 3 else '#f0c040' if diff > -3 else '#52b052'
+                        sched_teams.append(f"G{g+1} {opp_abbr}")
+                        sched_ovrs.append(round(opp_str, 1))
+                        sched_colors.append(color)
+
+                    if sched_teams:
+                        fig = go.Figure(go.Bar(
+                            x=sched_teams,
+                            y=sched_ovrs,
+                            marker_color=sched_colors,
+                            text=sched_ovrs,
+                            textposition='outside',
+                        ))
+                        fig.add_hline(
+                            y=my_strength,
+                            line_dash='dash', line_color='#4da6ff', line_width=2,
+                            annotation_text=f"Your OVR ({round(my_strength, 1)})",
+                            annotation_position='top right',
+                            annotation_font_color='#4da6ff',
+                        )
+                        fig.update_layout(
+                            plot_bgcolor='#0e1117',
+                            paper_bgcolor='#0e1117',
+                            font=dict(color='white'),
+                            yaxis=dict(range=[60, 100], title='Opponent OVR'),
+                            xaxis_title='Game',
+                            margin=dict(l=40, r=20, t=30, b=40),
+                            height=320,
+                            showlegend=False,
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.caption("🔴 Tough  🟡 Even  🟢 Favorable")
