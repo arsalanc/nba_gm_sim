@@ -172,6 +172,19 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
                 new_season_stam[name] = min(100, new_season_stam.get(name, 100) + 25)
         st.session_state.season_stamina = new_season_stam
 
+    # Overtime: if tied, play OT periods until someone leads
+    ot_period = 1
+    while total_score == opp_score:
+        ot_pts = random.randint(8, 16)
+        ot_opp = random.randint(8, 16)
+        if ot_pts != ot_opp:
+            total_score += ot_pts
+            opp_score += ot_opp
+        ot_period += 1
+        if ot_period > 5:  # safety cap: force a winner after 5 OTs
+            total_score += 1
+            break
+
     return total_score, opp_score, box_score, injury_reports, sub_reports, opp_team_name
 
 

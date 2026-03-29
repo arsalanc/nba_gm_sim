@@ -10,6 +10,9 @@ from nba_api.stats.endpoints import leagueleaders, playerindex
 # Use temp directory for cloud compatibility (Streamlit Cloud has a read-only working dir)
 SAVE_FILE = os.path.join(tempfile.gettempdir(), "gm_save.json")
 
+SALARY_CAP = 140_700_000
+LUXURY_TAX = 170_814_000
+
 
 # --- URL HELPERS ---
 def player_img_url(player_id):
