@@ -1,6 +1,8 @@
 import time
+import re
 
 import streamlit as st
+import plotly.graph_objects as go
 
 from utils import (
     team_logo_url, player_img_url, overall_badge, fmt_salary, save_state, SALARY_CAP,
@@ -14,7 +16,7 @@ from playoff_logic import _sim_playoff_round, _finish_user_series
 
 
 def render(my_team, current_team_id, roster, all_teams, all_stats,
-           season_phase, games_played, difficulty, hard):
+           season_phase, games_played, difficulty, hard, season_length=82):
     live = st.session_state.get('live_game')
 
     # ── LIVE GAME IN PROGRESS ────────────────────────────────────────────
@@ -147,7 +149,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                 st.text(event)
 
         if st.button("📊 View Final Results & Continue", type="primary"):
-            my_score, opp_score, box_score, injury_reports, sub_reports, opp_name = finalize_live_game(lg)
+            my_score, opp_score, box_score, injury_reports, sub_reports, opp_name, opp_box_score = finalize_live_game(lg)
             res = "W" if my_score > opp_score else "L"
             st.session_state.results.append(res)
             post_game_updates([], [], roster)
@@ -157,28 +159,31 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                 if int(p['PLAYER_ID']) == 0:
                     continue
                 st.session_state.season_pts[p['Player']] = (
-                    st.session_state.season_pts.get(p['Player'], 0) + p['Points']
+                    st.session_state.season_pts.get(p['Player'], 0) + p['PTS']
                 )
 
             played_opp_id = lg['opponent_id']
             st.session_state.last_game_result = {
                 'final_score': my_score, 'final_opp': opp_score,
-                'res': res, 'box_score': box_score,
+                'res': res, 'box_score': box_score, 'opp_box_score': opp_box_score,
                 'injury_reports': injury_reports, 'sub_reports': sub_reports,
                 'opp_name': opp_name, 'played_opp_id': played_opp_id,
+                'play_by_play': lg.get('play_by_play', []),
+                'my_team_abbr': lg.get('my_team_abbr', ''),
+                'opp_team_abbr': lg.get('opp_team_abbr', ''),
             }
             if res == 'W':
                 st.session_state.show_balloons = True
 
             # Update standings if regular season
-            if season_phase == 'regular' and games_played < 82:
+            if season_phase == 'regular' and games_played < season_length:
                 matchups = generate_round_matchups(all_teams, games_played)
                 other_results = simulate_other_games(matchups, current_team_id, all_stats)
                 opp_res = 'L' if res == 'W' else 'W'
                 all_results = {current_team_id: res, played_opp_id: opp_res, **other_results}
                 update_standings(st.session_state.standings, all_results)
                 st.session_state.games_played += 1
-                if st.session_state.games_played >= 82:
+                if st.session_state.games_played >= season_length:
                     st.session_state.season_phase = 'playoffs_pending'
             elif season_phase == 'playoffs_user':
                 series = st.session_state.current_series
@@ -294,7 +299,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                             p_mod = 1.2 if tactic == "Pace & Space" else 0.9 if tactic == "Grit & Grind" else 1.0
                             o_mod = 1.1 if tactic == "Pace & Space" else 0.8 if tactic == "Grit & Grind" else 1.0
 
-                        score, opp_score, box_score, injury_reports, sub_reports, opp_name = simulate_game(
+                        score, opp_score, box_score, injury_reports, sub_reports, opp_name, opp_box_score = simulate_game(
                             lineup_df, roster, tactic, all_stats, all_teams,
                             current_team_id, [],
                             opponent_team_id=series['opponent_id'],
@@ -314,7 +319,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
 
                         st.session_state.last_game_result = {
                             'final_score': final_score, 'final_opp': final_opp,
-                            'res': res, 'box_score': box_score,
+                            'res': res, 'box_score': box_score, 'opp_box_score': opp_box_score,
                             'injury_reports': injury_reports, 'sub_reports': sub_reports,
                             'opp_name': opp_name, 'played_opp_id': series['opponent_id'],
                         }
@@ -341,10 +346,10 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                 else:
                     st.info("Check the **Bracket** tab for playoff results.")
 
-        elif games_played >= 82:
+        elif games_played >= season_length:
             st.info("🏁 Regular season is complete! Head to **Standings** to see playoff picture.")
         else:
-            remaining = 82 - games_played
+            remaining = season_length - games_played
             live_col, sim_col1, sim_col2, sim_col3 = st.columns(4)
             live_btn = live_col.button("🎮 Play Live", key="play_live",
                                        disabled=remaining < 1)
@@ -389,7 +394,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
 
                     for game_i in range(num_games):
                         gp = st.session_state.games_played
-                        if gp >= 82:
+                        if gp >= season_length:
                             break
 
                         # Game 0 uses manual lineup; subsequent games auto-select
@@ -405,7 +410,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                         matchups = generate_round_matchups(all_teams, gp)
                         opp_id, _ = find_user_matchup(matchups, current_team_id)
 
-                        score, opp_score, box_score, injury_reports, sub_reports, opp_name = simulate_game(
+                        score, opp_score, box_score, injury_reports, sub_reports, opp_name, opp_box_score = simulate_game(
                             lineup_df, roster, tactic, all_stats, all_teams,
                             current_team_id, current_rested,
                             opponent_team_id=opp_id,
@@ -428,7 +433,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                             if " (sub for " in clean_name:
                                 clean_name = clean_name.split(" (sub for ")[0]
                             st.session_state.season_pts[clean_name] = (
-                                st.session_state.season_pts.get(clean_name, 0) + p['Points']
+                                st.session_state.season_pts.get(clean_name, 0) + p['PTS']
                             )
 
                         # Sim the other 14 matchups in this round
@@ -444,6 +449,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                             'final_opp': final_opp,
                             'res': res,
                             'box_score': box_score,
+                            'opp_box_score': opp_box_score,
                             'injury_reports': injury_reports,
                             'sub_reports': sub_reports,
                             'opp_name': opp_name,
@@ -459,7 +465,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                             st.session_state.show_balloons = True
 
                         # Check if season just ended
-                        if st.session_state.games_played >= 82:
+                        if st.session_state.games_played >= season_length:
                             st.session_state.season_phase = 'playoffs_pending'
 
                         save_state()
@@ -506,25 +512,93 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                 st.warning(f"🚑 {ir}")
 
             st.subheader("Box Score")
-            hdr = st.columns([1, 3, 1, 1, 2])
-            hdr[0].write("**Photo**")
-            hdr[1].write("**Player**")
-            hdr[2].write("**Pos**")
-            hdr[3].write("**PTS**")
-            hdr[4].write("**Stamina**")
-            st.divider()
-            for p in r['box_score']:
-                rc = st.columns([1, 3, 1, 1, 2])
-                pid = int(p['PLAYER_ID'])
-                if pid == 0:
-                    rc[0].write("🪑")
+            bs_tab_my, bs_tab_opp, bs_tab_flow = st.tabs([f"🏠 {my_team['abbreviation']}", f"🏀 {r['opp_name']}", "📈 Game Flow"])
+
+            def _render_box_score_table(box_rows):
+                hdr = st.columns([1, 3, 1, 1, 1, 1, 1, 1, 2])
+                for col, label in zip(hdr, ["", "Player", "PTS", "REB", "AST", "STL", "BLK", "TOV", "Stamina"]):
+                    col.write(f"**{label}**")
+                st.divider()
+                for p in box_rows:
+                    rc = st.columns([1, 3, 1, 1, 1, 1, 1, 1, 2])
+                    pid = int(p['PLAYER_ID'])
+                    if pid == 0:
+                        rc[0].write("🪑")
+                    else:
+                        rc[0].image(player_img_url(pid), width=50)
+                    rc[1].write(p['Player'])
+                    rc[2].write(str(p['PTS']))
+                    rc[3].write(str(p.get('REB', 0)))
+                    rc[4].write(str(p.get('AST', 0)))
+                    rc[5].write(str(p.get('STL', 0)))
+                    rc[6].write(str(p.get('BLK', 0)))
+                    rc[7].write(str(p.get('TOV', 0)))
+                    stam = p['Stamina Left']
+                    icon = "🟢" if stam >= 60 else "🟡" if stam >= 30 else "🔴"
+                    rc[8].write(f"{icon} {stam}%")
+
+            with bs_tab_my:
+                _render_box_score_table(r['box_score'])
+            with bs_tab_opp:
+                _render_box_score_table(r.get('opp_box_score', []))
+            with bs_tab_flow:
+                pbp = r.get('play_by_play', [])
+                my_abbr_flow = r.get('my_team_abbr', '')
+                opp_abbr_flow = r.get('opp_team_abbr', r['opp_name'])
+                if not pbp:
+                    st.info("Game flow is only available for live games.")
                 else:
-                    rc[0].image(player_img_url(pid), width=50)
-                rc[1].write(p['Player'])
-                p_row = all_stats[all_stats['PLAYER_ID'] == p['PLAYER_ID']]
-                pos = p_row.iloc[0].get('POSITION', '?') if not p_row.empty else '—'
-                rc[2].write(f"`{pos or '?'}`")
-                rc[3].write(str(p['Points']))
-                stam = p['Stamina Left']
-                icon = "🟢" if stam >= 60 else "🟡" if stam >= 30 else "🔴"
-                rc[4].write(f"{icon} {stam}%")
+                    my_pts_series, opp_pts_series = [], []
+                    quarter_breaks = []
+                    pattern = re.compile(r'\((\w+) (\d+), (\w+) (\d+)\)')
+                    prev_q = None
+                    for i, event in enumerate(pbp):
+                        m = pattern.search(event)
+                        if not m:
+                            continue
+                        a_abbr, a_pts, b_abbr, b_pts = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+                        if a_abbr == my_abbr_flow:
+                            my_pts_series.append(a_pts)
+                            opp_pts_series.append(b_pts)
+                        else:
+                            my_pts_series.append(b_pts)
+                            opp_pts_series.append(a_pts)
+                        # Detect quarter breaks from event label
+                        q_label = event.split(' ')[0]
+                        if prev_q and q_label != prev_q and not q_label.startswith('↔') and not q_label.startswith('🚨'):
+                            quarter_breaks.append(len(my_pts_series) - 1)
+                        prev_q = q_label
+
+                    if my_pts_series:
+                        fig = go.Figure()
+                        xs = list(range(len(my_pts_series)))
+                        fig.add_trace(go.Scatter(
+                            x=xs, y=my_pts_series,
+                            mode='lines', name=my_abbr_flow,
+                            line=dict(color='#4da6ff', width=2),
+                        ))
+                        fig.add_trace(go.Scatter(
+                            x=xs, y=opp_pts_series,
+                            mode='lines', name=opp_abbr_flow,
+                            line=dict(color='#aaaaaa', width=2, dash='dot'),
+                        ))
+                        for qb in quarter_breaks:
+                            fig.add_vline(x=qb, line_dash='dash', line_color='rgba(255,255,255,0.3)', line_width=1)
+                        lead_changes = sum(
+                            1 for i in range(1, len(my_pts_series))
+                            if (my_pts_series[i] > opp_pts_series[i]) != (my_pts_series[i-1] > opp_pts_series[i-1])
+                        )
+                        fig.update_layout(
+                            title=dict(text=f"{my_abbr_flow} {r['final_score']} — {opp_abbr_flow} {r['final_opp']}  ·  {lead_changes} lead changes", font=dict(size=14)),
+                            xaxis_title="Possession",
+                            yaxis_title="Score",
+                            plot_bgcolor='#0e1117',
+                            paper_bgcolor='#0e1117',
+                            font=dict(color='white'),
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                            margin=dict(l=40, r=20, t=60, b=40),
+                            height=350,
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("No scoring events to chart.")

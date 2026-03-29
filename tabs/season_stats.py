@@ -30,3 +30,40 @@ def render(all_stats, w, l):
             rc[2].write(f"{int(row['Total Points'])} pts")
     else:
         st.info("Play some games to see season stats here.")
+
+    # ── Win % Trend ───────────────────────────────────────────────────────────
+    results = st.session_state.results
+    if len(results) >= 5:
+        st.divider()
+        st.subheader("📈 Win % Trend")
+        win_pct = []
+        for i in range(1, len(results) + 1):
+            wins = results[:i].count('W')
+            win_pct.append(round(wins / i, 3))
+        st.line_chart(win_pct)
+        st.caption("Rolling win percentage over the season.")
+
+    # ── Analytics Feature Suggestions ────────────────────────────────────────
+    st.divider()
+    with st.expander("💡 Potential Analytics Features (Coming Soon?)"):
+        st.markdown("""
+These are features that could make the sim richer — let us know which you'd like to see:
+
+**1. 🕸️ Player Performance Radar**
+Spider chart (PTS / REB / AST / STL / BLK) for your starters vs. the opponent's top 5 — shown in the Gameplan tab before each game.
+
+**2. 💰 Salary vs. Performance Scatter**
+Bubble chart of your roster: X = salary, Y = overall rating, bubble size = PPG. Instantly spot overpaid players and trade targets.
+
+**3. 📅 Opponent Strength Schedule**
+Bar chart of remaining opponents sorted by OVR rating, color-coded easy/tough. Plan when to rest stars.
+
+**4. 🌡️ Stamina Heatmap** *(Hard Mode)*
+Grid of players × games showing end-of-game stamina across the season. Visualize who needs rest before injury strikes.
+
+**5. 🎲 Playoff Series Win Probability**
+Before each playoff game, show a gauge chart with simulated win probability based on OVR differential, stamina, and home/away.
+
+**6. 📊 Season Leader Boards**
+Full league-wide stat leaders (PTS, REB, AST leaders across all 30 teams), not just your roster.
+""")

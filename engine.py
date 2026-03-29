@@ -25,6 +25,7 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
     opp_bench_df = opp_roster[~opp_roster['PLAYER'].isin(opp_top5['PLAYER'])].nlargest(5, 'PTS')
 
     opp_score = 0
+    opp_box_score = []
     for _, opp_player in opp_top5.iterrows():
         # Hard: opponents play at near-full strength; Easy: wide variance favoring user
         opp_stam = random.randint(85, 100) if hard else random.randint(55, 100)
@@ -43,6 +44,17 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
             opp_bench_df = opp_bench_df.iloc[1:]  # remove used sub
 
         opp_score += opp_pts
+        opp_box_score.append({
+            "Player": opp_player['PLAYER'],
+            "PLAYER_ID": int(opp_player['PLAYER_ID']),
+            "PTS": opp_pts,
+            "REB": int(opp_player.get('REB', 0) * random.uniform(0.7, 1.3)),
+            "AST": int(opp_player.get('AST', 0) * random.uniform(0.7, 1.3)),
+            "STL": int(opp_player.get('STL', 0) * random.uniform(0.5, 1.5)),
+            "BLK": int(opp_player.get('BLK', 0) * random.uniform(0.5, 1.5)),
+            "TOV": int(opp_player.get('TOV', 0) * random.uniform(0.7, 1.3)),
+            "Stamina Left": opp_stam,
+        })
 
     # Bench contribution: Hard = scaled by actual bench quality; Easy = flat random
     if hard:
@@ -52,6 +64,13 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
     else:
         opp_bench_contribution = random.randint(30, 45)
     opp_score += opp_bench_contribution
+    opp_box_score.append({
+        "Player": "Bench / Role Players",
+        "PLAYER_ID": 0,
+        "PTS": opp_bench_contribution,
+        "REB": 0, "AST": 0, "STL": 0, "BLK": 0, "TOV": 0,
+        "Stamina Left": 100,
+    })
 
     starter_names = lineup_df['PLAYER'].tolist()
     injured_names = list(st.session_state.injured_list.keys())
@@ -91,14 +110,14 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
             box_score.append({
                 "Player": f"↔ {sub_name} (sub for {name.split()[-1]})",
                 "PLAYER_ID": int(sub['PLAYER_ID']),
-                "Points": sub_pts,
+                "PTS": sub_pts, "REB": 0, "AST": 0, "STL": 0, "BLK": 0, "TOV": 0,
                 "Stamina Left": new_sub_stam,
             })
             sub_reports.append(f"↔ {sub_name} subbed in for {name}")
             box_score.append({
                 "Player": name,
                 "PLAYER_ID": pid,
-                "Points": 0,
+                "PTS": 0, "REB": 0, "AST": 0, "STL": 0, "BLK": 0, "TOV": 0,
                 "Stamina Left": current_stam,
             })
             continue
@@ -137,10 +156,16 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
         new_stam = max(0, current_stam - drain)
         game_stamina[name] = new_stam
         total_score += pts
+        p_row = lineup_df[lineup_df['PLAYER'] == name].iloc[0] if name in lineup_df['PLAYER'].values else None
         box_score.append({
             "Player": name,
             "PLAYER_ID": pid,
-            "Points": pts,
+            "PTS": pts,
+            "REB": int(p_row['REB'] * random.uniform(0.7, 1.3)) if p_row is not None and 'REB' in p_row else 0,
+            "AST": int(p_row['AST'] * random.uniform(0.7, 1.3)) if p_row is not None and 'AST' in p_row else 0,
+            "STL": int(p_row['STL'] * random.uniform(0.5, 1.5)) if p_row is not None and 'STL' in p_row else 0,
+            "BLK": int(p_row['BLK'] * random.uniform(0.5, 1.5)) if p_row is not None and 'BLK' in p_row else 0,
+            "TOV": int(p_row['TOV'] * random.uniform(0.7, 1.3)) if p_row is not None and 'TOV' in p_row else 0,
             "Stamina Left": new_stam,
         })
 
@@ -157,7 +182,7 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
     box_score.append({
         "Player": "Bench / Role Players",
         "PLAYER_ID": 0,
-        "Points": bench_contribution,
+        "PTS": bench_contribution, "REB": 0, "AST": 0, "STL": 0, "BLK": 0, "TOV": 0,
         "Stamina Left": 100,
     })
 
@@ -185,7 +210,7 @@ def simulate_game(lineup_df, roster_df, tactic, all_stats, all_teams, my_team_id
             total_score += 1
             break
 
-    return total_score, opp_score, box_score, injury_reports, sub_reports, opp_team_name
+    return total_score, opp_score, box_score, injury_reports, sub_reports, opp_team_name, opp_box_score
 
 
 def post_game_updates(starter_names, rested_players, roster_df):
@@ -483,6 +508,9 @@ def simulate_quarter(live_game):
             pts_scored = 2
             player['game_fga'] += 1
             player['game_fgm'] += 1
+            teammates = [p for p in on_court if p is not player]
+            if teammates and random.random() < 0.6:
+                random.choice(teammates)['game_ast'] += 1
             event_text = f"{player['name']} scores inside"
         elif roll < (0.40 + 0.15 * fg3_rate / 0.35) * stam_mod * boost:
             # Made 3pt
@@ -491,6 +519,9 @@ def simulate_quarter(live_game):
             player['game_fgm'] += 1
             player['game_fg3a'] += 1
             player['game_fg3m'] += 1
+            teammates = [p for p in on_court if p is not player]
+            if teammates and random.random() < 0.7:
+                random.choice(teammates)['game_ast'] += 1
             event_text = f"{player['name']} hits a 3-pointer"
         elif roll < (0.40 + 0.15 * fg3_rate / 0.35 + 0.10) * stam_mod * boost:
             # Free throw foul
@@ -508,6 +539,10 @@ def simulate_quarter(live_game):
             # Rebound attributed to a random player
             rebounder = random.choice(on_court)
             rebounder['game_reb'] += 1
+            # Block credited to a random opponent (~20% of misses)
+            opp_court = live_game['opp_on_court'] if is_my_team else live_game['my_on_court']
+            if opp_court and random.random() < 0.20:
+                random.choice(opp_court)['game_blk'] += 1
             event_text = f"{player['name']} misses"
         else:
             # Turnover
@@ -630,7 +665,12 @@ def finalize_live_game(live_game):
             box_score.append({
                 "Player": p['name'],
                 "PLAYER_ID": p['player_id'],
-                "Points": p['game_pts'],
+                "PTS": p['game_pts'],
+                "REB": p['game_reb'],
+                "AST": p['game_ast'],
+                "STL": p['game_stl'],
+                "BLK": p['game_blk'],
+                "TOV": p['game_tov'],
                 "Stamina Left": int(p['stamina']),
             })
 
@@ -638,7 +678,30 @@ def finalize_live_game(live_game):
     box_score.append({
         "Player": "Bench / Role Players",
         "PLAYER_ID": 0,
-        "Points": 0,
+        "PTS": 0, "REB": 0, "AST": 0, "STL": 0, "BLK": 0, "TOV": 0,
+        "Stamina Left": 100,
+    })
+
+    # Opponent box score
+    opp_box_score = []
+    all_opp = live_game['opp_on_court'] + live_game['opp_bench']
+    for p in all_opp:
+        if p['game_pts'] > 0 or p['game_reb'] > 0 or p['game_ast'] > 0 or p.get('game_fga', 0) > 0:
+            opp_box_score.append({
+                "Player": p['name'],
+                "PLAYER_ID": p['player_id'],
+                "PTS": p['game_pts'],
+                "REB": p['game_reb'],
+                "AST": p['game_ast'],
+                "STL": p['game_stl'],
+                "BLK": p['game_blk'],
+                "TOV": p['game_tov'],
+                "Stamina Left": int(p['stamina']),
+            })
+    opp_box_score.append({
+        "Player": "Bench / Role Players",
+        "PLAYER_ID": 0,
+        "PTS": 0, "REB": 0, "AST": 0, "STL": 0, "BLK": 0, "TOV": 0,
         "Stamina Left": 100,
     })
 
@@ -670,4 +733,5 @@ def finalize_live_game(live_game):
         injury_reports,
         sub_reports,
         live_game['opponent_name'],
+        opp_box_score,
     )

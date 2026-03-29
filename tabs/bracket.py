@@ -181,7 +181,8 @@ def render(current_team_id, all_teams):
     standings = st.session_state.standings
 
     if not bracket:
-        st.info("The playoff bracket will appear here once the regular season is complete (82 games).")
+        season_length = st.session_state.get('season_length', 82)
+        st.info(f"The playoff bracket will appear here once the regular season is complete ({season_length} games).")
         return
 
     team_map_by_id = {t['id']: t for t in all_teams}
@@ -202,9 +203,7 @@ def render(current_team_id, all_teams):
 
     st.markdown(_BRACKET_CSS, unsafe_allow_html=True)
 
-    for conf in ('West', 'East'):
-        conf_label = 'Western Conference' if conf == 'West' else 'Eastern Conference'
-        st.markdown(f"### {conf_label}")
+    def _build_conf_rounds(conf):
         conf_data = bracket[conf]
 
         r1 = conf_data.get('round1', [])
@@ -231,44 +230,72 @@ def render(current_team_id, all_teams):
         else:
             cf_html = _tbd_matchup()
 
-        html = (
-            f'<div class="bracket-container">'
-            f'  <div class="bracket-round">'
-            f'    <div class="bracket-round-label">First Round</div>'
-            f'    {r1_html}'
-            f'  </div>'
-            f'  <div class="bracket-round bracket-round-r2">'
-            f'    <div class="bracket-round-label">Semifinals</div>'
-            f'    {r2_html}'
-            f'  </div>'
-            f'  <div class="bracket-round bracket-round-cf">'
-            f'    <div class="bracket-round-label">Conf Finals</div>'
-            f'    {cf_html}'
-            f'  </div>'
-            f'</div>'
-        )
-        st.markdown(html, unsafe_allow_html=True)
-        st.divider()
+        return r1_html, r2_html, cf_html
 
-    # NBA Finals
+    west_r1, west_r2, west_cf = _build_conf_rounds('West')
+    east_r1, east_r2, east_cf = _build_conf_rounds('East')
+
+    # Finals center column
     if bracket.get('finals'):
-        st.markdown('<div class="bracket-finals-label">NBA Finals</div>', unsafe_allow_html=True)
         a_id, b_id = bracket['finals']
         finals_html = _matchup_html(a_id, b_id, bracket, team_map_by_id, standings, current_team_id)
-        st.markdown(
-            f'<div style="display:flex;justify-content:center;">{finals_html}</div>',
-            unsafe_allow_html=True,
-        )
+    else:
+        finals_html = _tbd_matchup()
 
+    champion_html = ''
     if bracket.get('champion'):
         champ = team_map_by_id.get(bracket['champion'], {})
-        st.markdown(
-            f'<div class="bracket-champion">'
+        champion_html = (
+            f'<div class="bracket-champion" style="margin-top:12px;">'
             f'  <img src="{team_logo_url(bracket["champion"])}">'
-            f'  <div style="font-size:1.3rem;font-weight:bold;color:#ffd700;margin-top:8px;">'
+            f'  <div style="font-size:1.1rem;font-weight:bold;color:#ffd700;margin-top:6px;">'
             f'    🏆 {champ.get("full_name", "?")} 🏆'
             f'  </div>'
-            f'  <div style="color:#ccc;">NBA Champions</div>'
-            f'</div>',
-            unsafe_allow_html=True,
+            f'  <div style="color:#ccc;font-size:0.85rem;">NBA Champions</div>'
+            f'</div>'
         )
+
+    # Full bracket: West (L→R) | Finals | East (R→L mirrored)
+    html = (
+        f'<div style="overflow-x:auto;padding:12px 0;">'
+        f'<div style="display:flex;align-items:center;gap:16px;min-width:max-content;">'
+
+        # West: R1 → R2 → CF (left to right)
+        f'  <div class="bracket-round" style="align-items:flex-start;">'
+        f'    <div class="bracket-round-label">West · First Round</div>'
+        f'    {west_r1}'
+        f'  </div>'
+        f'  <div class="bracket-round bracket-round-r2" style="align-items:flex-start;">'
+        f'    <div class="bracket-round-label">Semifinals</div>'
+        f'    {west_r2}'
+        f'  </div>'
+        f'  <div class="bracket-round bracket-round-cf" style="align-items:flex-start;">'
+        f'    <div class="bracket-round-label">Conf Finals</div>'
+        f'    {west_cf}'
+        f'  </div>'
+
+        # Finals center
+        f'  <div style="display:flex;flex-direction:column;align-items:center;gap:8px;min-width:180px;">'
+        f'    <div class="bracket-finals-label" style="margin-bottom:4px;">NBA Finals</div>'
+        f'    {finals_html}'
+        f'    {champion_html}'
+        f'  </div>'
+
+        # East: CF → R2 → R1 (right to left mirror — rendered reversed)
+        f'  <div class="bracket-round bracket-round-cf" style="align-items:flex-end;">'
+        f'    <div class="bracket-round-label">Conf Finals</div>'
+        f'    {east_cf}'
+        f'  </div>'
+        f'  <div class="bracket-round bracket-round-r2" style="align-items:flex-end;">'
+        f'    <div class="bracket-round-label">Semifinals</div>'
+        f'    {east_r2}'
+        f'  </div>'
+        f'  <div class="bracket-round" style="align-items:flex-end;">'
+        f'    <div class="bracket-round-label">East · First Round</div>'
+        f'    {east_r1}'
+        f'  </div>'
+
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)

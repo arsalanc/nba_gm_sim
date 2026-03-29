@@ -28,7 +28,7 @@ def _render_player_card(col, player_row, injured_list=None):
     info_c.caption(" · ".join(stat_parts))
 
 
-def render(my_team, current_team_id, roster, all_teams, all_stats, season_phase, games_played):
+def render(my_team, current_team_id, roster, all_teams, all_stats, season_phase, games_played, season_length=82):
     next_opp_id = None
 
     if season_phase == 'playoffs_user' and st.session_state.current_series:
@@ -42,13 +42,13 @@ def render(my_team, current_team_id, roster, all_teams, all_stats, season_phase,
                  f"{next((t for t in all_teams if t['id'] == next_opp_id), {}).get('abbreviation', '?')}")
     elif season_phase in ('playoffs_spectate', 'offseason'):
         st.info("Your season is over. Check the **Standings** tab for playoff results.")
-    elif games_played >= 82:
+    elif games_played >= season_length:
         st.info("Regular season is over! Check the **Standings** tab for playoff picture.")
     else:
         matchups_preview = generate_round_matchups(all_teams, games_played)
         next_opp_id, _ = find_user_matchup(matchups_preview, current_team_id)
 
-    if next_opp_id is None and season_phase == 'regular' and games_played < 82:
+    if next_opp_id is None and season_phase == 'regular' and games_played < season_length:
         st.info("No upcoming opponent yet.")
     else:
         opp_team_info = next((t for t in all_teams if t['id'] == next_opp_id), None)

@@ -4,7 +4,7 @@ from utils import CONFERENCE, team_logo_url, save_state
 from engine import generate_playoff_bracket
 
 
-def render(my_team, current_team_id, all_teams, all_stats, games_played, season_phase):
+def render(my_team, current_team_id, all_teams, all_stats, games_played, season_phase, season_length=82):
     st.subheader("League Standings")
     standings = st.session_state.get('standings', {})
     team_map_by_id = {t['id']: t for t in all_teams}
@@ -12,7 +12,7 @@ def render(my_team, current_team_id, all_teams, all_stats, games_played, season_
     if not standings or all(s['w'] + s['l'] == 0 for s in standings.values()):
         st.info("Play some games to see standings.")
     else:
-        st.write(f"**Game {games_played} of 82**")
+        st.write(f"**Game {games_played} of {season_length}**")
         col_east, col_west = st.columns(2)
 
         for conf, col in [('East', col_east), ('West', col_west)]:

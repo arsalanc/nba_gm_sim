@@ -18,6 +18,7 @@ all_teams, all_stats = load_nba_data()
 _defaults = {
     'my_team_id': None,
     'difficulty': 'Easy',
+    'season_length': 82,
     'results': [],
     'season_pts': {},
     'injured_list': {},
@@ -57,9 +58,21 @@ if st.session_state.my_team_id is None:
              "injuries are more frequent, stamina carries over between games, and trades are harder to pull off.",
     )
 
+    season_length_choice = st.radio(
+        "Season Length:",
+        [20, 41, 82],
+        index=2,
+        horizontal=True,
+        format_func=lambda x: f"{x} games",
+        help="**20 games:** Quick season, good for testing.\n\n"
+             "**41 games:** Half-season, balanced experience.\n\n"
+             "**82 games:** Full NBA regular season.",
+    )
+
     if st.button("✍️ Sign Contract"):
         st.session_state.my_team_id = team_map[selected]
         st.session_state.difficulty = diff_choice
+        st.session_state.season_length = season_length_choice
         st.session_state.standings = {t['id']: {'w': 0, 'l': 0} for t in all_teams}
         save_state()
         st.rerun()
@@ -87,12 +100,13 @@ else:
     games_played = st.session_state.get('games_played', 0)
     season_phase = st.session_state.get('season_phase', 'regular')
     difficulty = st.session_state.get('difficulty', 'Easy')
+    season_length = st.session_state.get('season_length', 82)
     hard = difficulty == 'Hard'
 
     st.sidebar.header(my_team['full_name'])
     diff_badge = "🔴 Hard" if hard else "🟢 Easy"
     if season_phase == 'regular':
-        st.sidebar.write(f"**Record:** {w}W — {l}L  ·  Game {games_played}/82  ·  {diff_badge}")
+        st.sidebar.write(f"**Record:** {w}W — {l}L  ·  Game {games_played}/{season_length}  ·  {diff_badge}")
     elif season_phase in ('playoffs_user', 'playoffs_spectate'):
         st.sidebar.write(f"**Record:** {w}W — {l}L  ·  Playoffs  ·  {diff_badge}")
     else:
@@ -153,20 +167,20 @@ else:
     ]
 
     # ── MAIN TABS ─────────────────────────────────────────────────────────────
-    tab_gameplan, tab_game, tab_trade, tab_standings, tab_bracket, tab_stats = st.tabs(
-        ["📝 Gameplan", "🏟️ Game Day", "📋 Trade Desk", "🏆 Standings", "🏀 Bracket", "📊 Season Stats"]
+    tab_gameplan, tab_game, tab_trade, tab_standings, tab_bracket, tab_stats, tab_howto = st.tabs(
+        ["📝 Gameplan", "🏟️ Game Day", "📋 Trade Desk", "🏆 Standings", "🏀 Bracket", "📊 Season Stats", "❓ How to Play"]
     )
 
     # ── GAMEPLAN ──────────────────────────────────────────────────────────────
     with tab_gameplan:
         from tabs.gameplan import render as render_gameplan
-        render_gameplan(my_team, current_team_id, roster, all_teams, all_stats, season_phase, games_played)
+        render_gameplan(my_team, current_team_id, roster, all_teams, all_stats, season_phase, games_played, season_length)
 
     # ── GAME DAY ──────────────────────────────────────────────────────────────
     with tab_game:
         from tabs.game_day import render as render_game_day
         render_game_day(my_team, current_team_id, roster, all_teams, all_stats,
-                        season_phase, games_played, difficulty, hard)
+                        season_phase, games_played, difficulty, hard, season_length)
 
 
     # ── TRADE DESK ────────────────────────────────────────────────────────────
@@ -177,7 +191,7 @@ else:
     # ── STANDINGS ─────────────────────────────────────────────────────────────
     with tab_standings:
         from tabs.standings import render as render_standings
-        render_standings(my_team, current_team_id, all_teams, all_stats, games_played, season_phase)
+        render_standings(my_team, current_team_id, all_teams, all_stats, games_played, season_phase, season_length)
 
     # ── PLAYOFF BRACKET ──────────────────────────────────────────────────────
     with tab_bracket:
@@ -189,3 +203,8 @@ else:
     with tab_stats:
         from tabs.season_stats import render as render_season_stats
         render_season_stats(all_stats, w, l)
+
+    # ── HOW TO PLAY ───────────────────────────────────────────────────────────
+    with tab_howto:
+        from tabs.how_to_play import render as render_how_to_play
+        render_how_to_play()
