@@ -228,59 +228,78 @@ def load_state():
 
 
 # --- DATA ---
+# Bundled snapshot for hosts that can't reach stats.nba.com (the NBA blocks
+# datacenter IPs, which includes Streamlit Cloud). Regenerate with:
+#   python make_snapshot.py
+SNAPSHOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nba_snapshot.csv")
+
+
+def fetch_live_nba_stats(timeout=10):
+    """Fetch and fully process current league data from stats.nba.com.
+    Raises on network failure — callers decide the fallback."""
+    raw_data = leagueleaders.LeagueLeaders(
+        season='2025-26', per_mode48='PerGame', timeout=timeout
+    ).get_dict()
+    headers = raw_data['resultSet']['headers']
+    rows = raw_data['resultSet']['rowSet']
+    df = pd.DataFrame(rows, columns=headers)
+    df['TEAM_ID'] = df['TEAM_ID'].astype(int)
+    df['PLAYER_ID'] = df['PLAYER_ID'].astype(int)
+    df['SALARY'] = df['PTS'].apply(estimate_salary)
+
+    # Player positions via PlayerIndex (single call for all active players)
+    try:
+        pi = playerindex.PlayerIndex(season='2025-26', active_nullable=1, timeout=timeout)
+        pi_df = pi.get_data_frames()[0]
+        pos_map = dict(zip(pi_df['PERSON_ID'].astype(int), pi_df['POSITION']))
+        df['POSITION'] = df['PLAYER_ID'].map(pos_map)
+        # replace empty strings as well as NaN
+        df['POSITION'] = df['POSITION'].replace('', None).fillna('?')
+
+        # Age estimate for Franchise Mode aging: ~21 at draft/debut year.
+        # (2026 = current 2025-26 season; rough is fine for a growth curve.)
+        draft_yr = pd.to_numeric(pi_df.get('DRAFT_YEAR'), errors='coerce')
+        from_yr = pd.to_numeric(pi_df.get('FROM_YEAR'), errors='coerce')
+        start_yr = draft_yr.fillna(from_yr)
+        age_est = (2026 - start_yr + 21).clip(19, 44)
+        age_map = dict(zip(pi_df['PERSON_ID'].astype(int), age_est))
+        df['AGE'] = df['PLAYER_ID'].map(age_map).fillna(27).astype(int)
+    except Exception:
+        df['POSITION'] = '?'
+        df['AGE'] = 27
+
+    # Overall rating: NBA efficiency formula normalised to 60-99
+    eff_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'FGA', 'FGM', 'FTA', 'FTM', 'TOV']
+    if all(c in df.columns for c in eff_cols):
+        df['_EFF'] = (
+            df['PTS'] + df['REB'] + df['AST'] + df['STL'] + df['BLK']
+            - (df['FGA'] - df['FGM']) - (df['FTA'] - df['FTM']) - df['TOV']
+        )
+    else:
+        df['_EFF'] = df['PTS']   # fallback
+    eff_min, eff_max = df['_EFF'].min(), df['_EFF'].max()
+    df['OVERALL'] = (
+        (df['_EFF'] - eff_min) / (eff_max - eff_min) * 39 + 60
+    ).clip(60, 99).astype(int)
+    df.drop(columns=['_EFF'], inplace=True)
+    return df
+
+
 @st.cache_data
 def load_nba_data():
+    """Returns (teams, stats_df, source). source is 'live' or 'snapshot'.
+    Team list is a static offline table; only the stats need the network."""
+    nba_teams = teams.get_teams()
     try:
-        nba_teams = teams.get_teams()
-        raw_data = leagueleaders.LeagueLeaders(season='2025-26', per_mode48='PerGame').get_dict()
-        headers = raw_data['resultSet']['headers']
-        rows = raw_data['resultSet']['rowSet']
-        df = pd.DataFrame(rows, columns=headers)
-        df['TEAM_ID'] = df['TEAM_ID'].astype(int)
-        df['PLAYER_ID'] = df['PLAYER_ID'].astype(int)
-        df['SALARY'] = df['PTS'].apply(estimate_salary)
-
-        # Player positions via PlayerIndex (single call for all active players)
-        try:
-            pi = playerindex.PlayerIndex(season='2025-26', active_nullable=1)
-            pi_df = pi.get_data_frames()[0]
-            pos_map = dict(zip(pi_df['PERSON_ID'].astype(int), pi_df['POSITION']))
-            df['POSITION'] = df['PLAYER_ID'].map(pos_map)
-            # replace empty strings as well as NaN
-            df['POSITION'] = df['POSITION'].replace('', None).fillna('?')
-
-            # Age estimate for Franchise Mode aging: ~21 at draft/debut year.
-            # (2026 = current 2025-26 season; rough is fine for a growth curve.)
-            draft_yr = pd.to_numeric(pi_df.get('DRAFT_YEAR'), errors='coerce')
-            from_yr = pd.to_numeric(pi_df.get('FROM_YEAR'), errors='coerce')
-            start_yr = draft_yr.fillna(from_yr)
-            age_est = (2026 - start_yr + 21).clip(19, 44)
-            age_map = dict(zip(pi_df['PERSON_ID'].astype(int), age_est))
-            df['AGE'] = df['PLAYER_ID'].map(age_map).fillna(27).astype(int)
-        except Exception as e:
-            st.warning(f"⚠️ Could not load player positions: {e}")
-            df['POSITION'] = '?'
-            df['AGE'] = 27
-
-        # Overall rating: NBA efficiency formula normalised to 60-99
-        eff_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'FGA', 'FGM', 'FTA', 'FTM', 'TOV']
-        if all(c in df.columns for c in eff_cols):
-            df['_EFF'] = (
-                df['PTS'] + df['REB'] + df['AST'] + df['STL'] + df['BLK']
-                - (df['FGA'] - df['FGM']) - (df['FTA'] - df['FTM']) - df['TOV']
-            )
-        else:
-            df['_EFF'] = df['PTS']   # fallback
-        eff_min, eff_max = df['_EFF'].min(), df['_EFF'].max()
-        df['OVERALL'] = (
-            (df['_EFF'] - eff_min) / (eff_max - eff_min) * 39 + 60
-        ).clip(60, 99).astype(int)
-        df.drop(columns=['_EFF'], inplace=True)
-
-        return nba_teams, df
+        return nba_teams, fetch_live_nba_stats(), 'live'
     except Exception as e:
-        st.error(f"Data Load Failed: {e}")
-        return [], pd.DataFrame(columns=['PLAYER', 'TEAM_ID', 'PTS', 'PLAYER_ID', 'SALARY'])
+        if os.path.exists(SNAPSHOT_FILE):
+            df = pd.read_csv(SNAPSHOT_FILE)
+            df['TEAM_ID'] = df['TEAM_ID'].astype(int)
+            df['PLAYER_ID'] = df['PLAYER_ID'].astype(int)
+            return nba_teams, df, 'snapshot'
+        st.error(f"Data Load Failed (and no bundled snapshot found): {e}")
+        return [], pd.DataFrame(columns=['PLAYER', 'TEAM_ID', 'PTS', 'PLAYER_ID', 'SALARY']), 'none'
 
 
 # --- TRADE EVALUATION ---

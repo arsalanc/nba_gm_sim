@@ -13,7 +13,9 @@ st.set_page_config(page_title="NBA GM Sim", layout="wide")
 st.title("🏀 NBA GM Simulator")
 
 load_state()
-all_teams, all_stats = load_nba_data()
+all_teams, all_stats, data_source = load_nba_data()
+if data_source == 'snapshot':
+    st.caption("📦 Live NBA stats unreachable from this host — using the bundled roster snapshot.")
 
 # Default session state (skipped if already loaded from save)
 _defaults = {
