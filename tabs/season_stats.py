@@ -1,12 +1,29 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
 
-from utils import player_img_url, team_logo_url
+from utils import player_img_url, team_logo_url, fmt_salary
 
 
-def render(all_stats, w, l, all_teams):
+def render(all_stats, w, l, all_teams, roster=None, my_team=None):
     st.subheader("Season Statistics")
     st.write(f"**Games played:** {len(st.session_state.results)} | **Record:** {w}W — {l}L")
+
+    # ── Team MVP — the player carrying your team this season ───────────────────
+    if st.session_state.season_pts:
+        mvp_name, mvp_pts = max(st.session_state.season_pts.items(), key=lambda kv: kv[1])
+        mvp_row = all_stats[all_stats['PLAYER'] == mvp_name]
+        games = max(len(st.session_state.results), 1)
+        st.markdown("#### 🏅 Team MVP")
+        mc = st.columns([1, 5])
+        if not mvp_row.empty:
+            mc[0].image(player_img_url(int(mvp_row.iloc[0]['PLAYER_ID'])), width=70)
+        mc[1].markdown(
+            f"**{mvp_name}** — {mvp_pts} total points "
+            f"(**{mvp_pts / games:.1f}** per game across {games} games)"
+        )
+        st.divider()
 
     if st.session_state.season_pts:
         df_leader = (
@@ -86,24 +103,65 @@ def render(all_stats, w, l, all_teams):
     with lb_ast:
         _leader_table('AST', 'APG')
 
-    # ── Analytics Feature Suggestions ────────────────────────────────────────
-    st.divider()
-    with st.expander("💡 Potential Analytics Features (Coming Soon?)"):
-        st.markdown("""
-These are features that could make the sim richer — let us know which you'd like to see:
+    # ── Salary vs. Performance — spot overpaid players & trade targets ────────
+    if roster is not None and not roster.empty and 'OVERALL' in roster.columns:
+        st.divider()
+        st.subheader("💰 Roster Value Map")
+        st.caption("Each bubble is a player on your roster — X = salary, Y = overall rating, "
+                   "size = PPG. Players **below the line** are overpaid; **above it** are bargains.")
 
-**1. 🕸️ Player Performance Radar**
-Spider chart (PTS / REB / AST / STL / BLK) for your starters vs. the opponent's top 5 — shown in the Gameplan tab before each game.
+        rdf = roster.copy()
+        rdf['SAL_M'] = rdf['SALARY'] / 1_000_000
 
-**2. 💰 Salary vs. Performance Scatter**
-Bubble chart of your roster: X = salary, Y = overall rating, bubble size = PPG. Instantly spot overpaid players and trade targets.
+        # Fair-value reference line: league relationship between salary and OVR
+        league = all_stats.copy()
+        league['SAL_M'] = league['SALARY'] / 1_000_000
+        if league['SAL_M'].std() > 1e-6:
+            slope, intercept = np.polyfit(league['SAL_M'], league['OVERALL'], 1)
+        else:
+            slope, intercept = 0.0, league['OVERALL'].mean()
 
-**3. 🌡️ Stamina Heatmap** *(Hard Mode)*
-Grid of players × games showing end-of-game stamina across the season. Visualize who needs rest before injury strikes.
+        rdf['fair_ovr'] = slope * rdf['SAL_M'] + intercept
+        rdf['verdict'] = rdf.apply(
+            lambda r: 'Bargain' if r['OVERALL'] >= r['fair_ovr'] + 2
+            else 'Overpaid' if r['OVERALL'] <= r['fair_ovr'] - 2 else 'Fair', axis=1)
+        color_map = {'Bargain': '#52b052', 'Fair': '#f0c040', 'Overpaid': '#e05252'}
 
-**4. 🎲 Playoff Series Win Probability**
-Before each playoff game, show a gauge chart with simulated win probability based on OVR differential, stamina, and home/away.
+        fig = go.Figure()
+        for verdict, grp in rdf.groupby('verdict'):
+            fig.add_trace(go.Scatter(
+                x=grp['SAL_M'], y=grp['OVERALL'],
+                mode='markers+text',
+                name=verdict,
+                marker=dict(
+                    size=(grp['PTS'].clip(lower=1)) * 2.2,
+                    color=color_map.get(verdict, '#888'),
+                    line=dict(width=1, color='white'), opacity=0.8,
+                ),
+                text=grp['PLAYER'].apply(lambda s: s.split()[-1]),
+                textposition='top center',
+                textfont=dict(size=10, color='white'),
+                customdata=grp[['PLAYER', 'PTS']].values,
+                hovertemplate='%{customdata[0]}<br>$%{x:.1f}M · OVR %{y}<br>%{customdata[1]:.1f} PPG<extra></extra>',
+            ))
+        xline = [rdf['SAL_M'].min(), rdf['SAL_M'].max()]
+        fig.add_trace(go.Scatter(
+            x=xline, y=[slope * x + intercept for x in xline],
+            mode='lines', name='Fair value',
+            line=dict(color='rgba(255,255,255,0.4)', width=2, dash='dash'),
+            hoverinfo='skip',
+        ))
+        fig.update_layout(
+            plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white'),
+            xaxis=dict(title='Salary ($M)'), yaxis=dict(title='Overall rating'),
+            margin=dict(l=40, r=20, t=20, b=40), height=420,
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-**5. 📅 Season Selection**
-Choose which NBA season's roster and stats to pull (e.g. 2023-24, 2024-25, 2025-26). Play with your favorite era's rosters or compare different seasons.
-""")
+        overpaid = rdf[rdf['verdict'] == 'Overpaid'].sort_values('SALARY', ascending=False)
+        if not overpaid.empty:
+            worst = overpaid.iloc[0]
+            st.caption(f"🔎 Trade-block candidate: **{worst['PLAYER']}** "
+                       f"({fmt_salary(worst['SALARY'])}, OVR {int(worst['OVERALL'])}, "
+                       f"{worst['PTS']:.1f} PPG) is your most overpaid player.")

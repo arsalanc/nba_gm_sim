@@ -1,7 +1,7 @@
 import streamlit as st
 
 from utils import CONFERENCE, team_logo_url, save_state
-from engine import generate_playoff_bracket
+from engine import generate_playoff_bracket, setup_playoffs_only
 
 
 def render(my_team, current_team_id, all_teams, all_stats, games_played, season_phase, season_length=82):
@@ -12,7 +12,10 @@ def render(my_team, current_team_id, all_teams, all_stats, games_played, season_
     if not standings or all(s['w'] + s['l'] == 0 for s in standings.values()):
         st.info("Play some games to see standings.")
     else:
-        st.write(f"**Game {games_played} of {season_length}**")
+        if season_length == 0:
+            st.caption("🏆 Playoffs Only — regular-season records were simulated")
+        else:
+            st.write(f"**Game {games_played} of {season_length}**")
         col_east, col_west = st.columns(2)
 
         for conf, col in [('East', col_east), ('West', col_west)]:
@@ -96,8 +99,9 @@ def render(my_team, current_team_id, all_teams, all_stats, games_played, season_
             save_state()
             st.rerun()
 
-        # Show bracket summary if playoffs are underway
-        if season_phase in ('playoffs_user', 'playoffs_spectate') and st.session_state.playoff_bracket:
+        # Show bracket summary if playoffs are underway (or just finished —
+        # the champion banner and season-rollover button live in this block)
+        if season_phase in ('playoffs_user', 'playoffs_spectate', 'offseason') and st.session_state.playoff_bracket:
             st.divider()
             st.subheader("🏆 Playoff Bracket")
             bracket = st.session_state.playoff_bracket
@@ -152,7 +156,37 @@ def render(my_team, current_team_id, all_teams, all_stats, games_played, season_
                 st.balloons()
                 st.success(f"🏆🏆🏆 **{champ_info.get('full_name', '?')}** WIN THE NBA CHAMPIONSHIP! 🏆🏆🏆")
 
-                if st.button("🔄 Start New Season"):
+                franchise = (st.session_state.get('franchise_mode')
+                             and st.session_state.get('season_length', 82) != 0)
+                if franchise:
+                    st.caption("🏛️ Franchise Mode: the offseason runs player aging and "
+                               "retirements, then the draft lottery and your pick.")
+                    if st.button("🏛️ Enter Offseason — Aging, Retirements & Draft", type="primary"):
+                        from offseason import (
+                            compute_offseason_aging, generate_draft_class, compute_draft_order,
+                        )
+                        prog, retired, risers, fallers = compute_offseason_aging(
+                            all_stats, st.session_state.player_progression
+                        )
+                        st.session_state.player_progression = prog
+                        st.session_state.retired_players = (
+                            st.session_state.retired_players + [r['name'] for r in retired]
+                        )
+                        st.session_state.offseason_report = {
+                            'retired': retired, 'risers': risers, 'fallers': fallers,
+                        }
+                        st.session_state.draft_state = {
+                            'order': compute_draft_order(standings),
+                            'prospects': generate_draft_class(
+                                all_stats['PLAYER'].tolist(),
+                                st.session_state.season_number,
+                            ),
+                            'picks': [],
+                        }
+                        st.session_state.season_phase = 'draft'
+                        save_state()
+                        st.rerun()
+                elif st.button("🔄 Start New Season"):
                     st.session_state.results = []
                     st.session_state.season_pts = {}
                     st.session_state.injured_list = {}
@@ -165,5 +199,15 @@ def render(my_team, current_team_id, all_teams, all_stats, games_played, season_
                     st.session_state.batch_results = None
                     st.session_state.season_stamina = {}
                     st.session_state.trade_cooldown = 0
+                    # Playoffs Only mode: re-sim the regular season and drop
+                    # straight back into a fresh bracket.
+                    if st.session_state.get('season_length', 82) == 0:
+                        new_standings, new_bracket, new_series = setup_playoffs_only(
+                            all_teams, all_stats, current_team_id
+                        )
+                        st.session_state.standings = new_standings
+                        st.session_state.playoff_bracket = new_bracket
+                        st.session_state.current_series = new_series
+                        st.session_state.season_phase = 'playoffs_user'
                     save_state()
                     st.rerun()

@@ -5,7 +5,8 @@ import streamlit as st
 import plotly.graph_objects as go
 
 from utils import (
-    team_logo_url, player_img_url, overall_badge, fmt_salary, save_state, SALARY_CAP,
+    team_logo_url, player_img_url, overall_badge, fmt_salary, save_state,
+    salary_cap_for_season, TACTICS, lineup_defense_factor,
 )
 from engine import (
     simulate_game, post_game_updates, generate_round_matchups, find_user_matchup,
@@ -13,6 +14,41 @@ from engine import (
     init_live_game, simulate_quarter, apply_user_subs, finalize_live_game,
 )
 from playoff_logic import _sim_playoff_round, _finish_user_series
+
+
+def _clean_player_name(raw):
+    """Strip sub annotations like '↔ Name (sub for X)' down to the bare name."""
+    name = raw.replace("↔ ", "").strip()
+    if " (sub" in name:
+        name = name.split(" (sub")[0]
+    return name
+
+
+def _game_headline(r, my_team_name):
+    """Build a newspaper-style headline + Player of the Game from a result dict."""
+    won = r['res'] == 'W'
+    winner_box = r['box_score'] if won else r.get('opp_box_score', [])
+    players = [p for p in winner_box if int(p.get('PLAYER_ID', 0)) != 0]
+    if not players:
+        return None, None
+    star = max(players, key=lambda p: p['PTS'] + 0.5 * p.get('REB', 0) + 0.5 * p.get('AST', 0))
+    star_name = _clean_player_name(star['Player'])
+    winner_name = my_team_name if won else r['opp_name']
+    loser_name = r['opp_name'] if won else my_team_name
+    hi, lo = max(r['final_score'], r['final_opp']), min(r['final_score'], r['final_opp'])
+    margin = hi - lo
+    if margin >= 18:
+        verb = "demolish"
+    elif margin >= 10:
+        verb = "pull away from"
+    elif margin >= 4:
+        verb = "hold off"
+    else:
+        verb = "edge"
+    headline = f"📰 **{star_name} drops {star['PTS']}** as the {winner_name} {verb} the {loser_name}, {hi}–{lo}"
+    potg = (f"⭐ Player of the Game: **{star_name}** — {star['PTS']} PTS"
+            f" / {star.get('REB', 0)} REB / {star.get('AST', 0)} AST")
+    return headline, potg
 
 
 def render(my_team, current_team_id, roster, all_teams, all_stats,
@@ -93,11 +129,12 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
             sub_out = st.selectbox("Sub out:", on_court_names, key="sub_out")
         with sub_col2:
             st.caption("**Bench**")
-            bench_names = [f"{p['name']} ({int(p['stamina'])}%)" for p in lg['my_bench']]
+            available_bench = [p for p in lg['my_bench'] if not p.get('out')]
+            bench_names = [f"{p['name']} ({int(p['stamina'])}%)" for p in available_bench]
             if bench_names:
                 sub_in_idx = st.selectbox("Sub in:", range(len(bench_names)),
                                           format_func=lambda i: bench_names[i], key="sub_in")
-                sub_in_name = lg['my_bench'][sub_in_idx]['name'] if bench_names else None
+                sub_in_name = available_bench[sub_in_idx]['name']
             else:
                 st.caption("No bench players available")
                 sub_in_name = None
@@ -211,14 +248,19 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
 
         st.subheader("📋 Game Plan")
         tactic = st.radio("Select Strategy:", ["Balanced", "Pace & Space", "Grit & Grind"], horizontal=True)
-        st.caption({
-            "Balanced": "1.0× offense and defense.",
-            "Pace & Space": "1.2× your score, 1.1× opponent score. High-risk, high-reward.",
-            "Grit & Grind": "0.9× your score, 0.8× opponent score. Defensive identity, more stamina drain.",
-        }[tactic])
+        st.caption(TACTICS[tactic]['blurb'])
 
         # current_starters is pre-computed by app.py from checkbox widget state before tabs render
         _cur_starters = st.session_state.current_starters
+
+        # Load management (Hard mode): players the user has chosen to rest sit out
+        # the next game entirely and recover full stamina. Honored only for
+        # non-starters in the regular season.
+        _rest_selection = st.session_state.get('rest_players', []) if hard else []
+        _effective_rested = [
+            p for p in _rest_selection
+            if p not in _cur_starters and p not in injured_names
+        ]
 
         if season_phase == 'playoffs_spectate':
             st.info("🏁 Your season is over. Watch the playoffs unfold from the **Standings** tab.")
@@ -245,6 +287,7 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                     mc.write(f"Series: {my_team['abbreviation']} **{series['user_wins']}** — "
                              f"**{series['opp_wins']}** {opp_info['abbreviation']}")
 
+                st.caption("🔥 **Playoff intensity:** opponents play near full strength — no easy nights from here.")
                 pl_col1, pl_col2 = st.columns(2)
                 sim_playoff = pl_col1.button("🏟️ Sim Playoff Game")
                 live_playoff = pl_col2.button("🎮 Play Live Playoff Game")
@@ -262,21 +305,13 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                         st.rerun()
                     else:
                         lineup_df = roster[roster['PLAYER'].isin(_cur_starters)]
-                        if hard:
-                            p_mod = 1.1 if tactic == "Pace & Space" else 0.85 if tactic == "Grit & Grind" else 1.0
-                            o_mod = 1.1 if tactic == "Pace & Space" else 0.85 if tactic == "Grit & Grind" else 1.0
-                        else:
-                            p_mod = 1.2 if tactic == "Pace & Space" else 0.9 if tactic == "Grit & Grind" else 1.0
-                            o_mod = 1.1 if tactic == "Pace & Space" else 0.8 if tactic == "Grit & Grind" else 1.0
-
-                        score, opp_score, box_score, injury_reports, sub_reports, opp_name, opp_box_score = simulate_game(
+                        final_score, final_opp, box_score, injury_reports, sub_reports, opp_name, opp_box_score = simulate_game(
                             lineup_df, roster, tactic, all_stats, all_teams,
                             current_team_id, [],
                             opponent_team_id=series['opponent_id'],
                             difficulty=difficulty,
+                            is_playoffs=True,
                         )
-                        final_score = int(score * p_mod)
-                        final_opp = int(opp_score * o_mod)
                         res = "W" if final_score > final_opp else "L"
 
                         starter_names_list = lineup_df['PLAYER'].tolist()
@@ -320,15 +355,35 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
             st.info("🏁 Regular season is complete! Head to **Standings** to see playoff picture.")
         else:
             remaining = season_length - games_played
-            live_col, sim_col1, sim_col2, sim_col3 = st.columns(4)
+            # Alternating home/away schedule: even game index = home (±2% scoring)
+            _is_home = games_played % 2 == 0
+            _next_matchups = generate_round_matchups(all_teams, games_played)
+            _next_opp_id, _ = find_user_matchup(_next_matchups, current_team_id)
+            _next_opp = next((t for t in all_teams if t['id'] == _next_opp_id), None)
+            if _next_opp:
+                venue = "🏠 vs" if _is_home else "✈️ @"
+                st.markdown(f"**Next game:** {venue} **{_next_opp['full_name']}** "
+                            f"({'home court +2%' if _is_home else 'road game -2%'})")
+            if _effective_rested:
+                st.caption(f"💤 Resting next game: **{', '.join(_effective_rested)}** "
+                           f"(full recovery, won't play)")
+            live_col, sim_col1, ff_sel_col, ff_go_col = st.columns([1.1, 1.1, 1.6, 0.7])
             live_btn = live_col.button("🎮 Play Live", key="play_live",
                                        disabled=remaining < 1)
             sim_1 = sim_col1.button("🏟️ Sim 1 Game", key="sim_1",
                                      disabled=remaining < 1)
-            sim_5 = sim_col2.button("⏩ Sim 5 Games", key="sim_5",
-                                     disabled=remaining < 1)
-            sim_10 = sim_col3.button("⏭️ Sim 10 Games", key="sim_10",
-                                      disabled=remaining < 1)
+            # Fast-forward targets milestones, not arbitrary game counts
+            deadline_game = int(season_length * 0.75)
+            ff_options = {"⏩ 5 games": 5, "⏩ 10 games": 10}
+            if games_played < deadline_game:
+                ff_options[f"⏳ Trade deadline (game {deadline_game})"] = deadline_game - games_played
+            ff_options["🏁 End of regular season"] = remaining
+            ff_choice = ff_sel_col.selectbox("Fast forward:", list(ff_options),
+                                             key="ff_choice", label_visibility="collapsed",
+                                             disabled=remaining < 1)
+            ff_go = ff_go_col.button("Sim ▶", key="ff_go", disabled=remaining < 1)
+            st.caption("Fast-forward plays your selected lineup for the first game, then auto-picks "
+                       "the best healthy five — injuries, stamina, and streaks still apply.")
 
             if live_btn:
                 if len(_cur_starters) != 5:
@@ -340,37 +395,34 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                     opp_id, _ = find_user_matchup(matchups, current_team_id)
                     lg = init_live_game(lineup_df, roster, all_stats, all_teams,
                                         current_team_id, opp_id, tactic,
-                                        difficulty=difficulty)
+                                        difficulty=difficulty,
+                                        rested_players=_effective_rested,
+                                        is_home=(gp % 2 == 0))
                     st.session_state.live_game = lg
                     save_state()
                     st.rerun()
 
             num_games = 0
             if sim_1: num_games = min(1, remaining)
-            elif sim_5: num_games = min(5, remaining)
-            elif sim_10: num_games = min(10, remaining)
+            elif ff_go: num_games = min(ff_options[ff_choice], remaining)
 
             if num_games > 0:
                 if len(_cur_starters) != 5:
                     st.error("Select exactly 5 starters to continue.")
                 else:
-                    if hard:
-                        p_mod = 1.1 if tactic == "Pace & Space" else 0.85 if tactic == "Grit & Grind" else 1.0
-                        o_mod = 1.1 if tactic == "Pace & Space" else 0.85 if tactic == "Grit & Grind" else 1.0
-                    else:
-                        p_mod = 1.2 if tactic == "Pace & Space" else 0.9 if tactic == "Grit & Grind" else 1.0
-                        o_mod = 1.1 if tactic == "Pace & Space" else 0.8 if tactic == "Grit & Grind" else 1.0
                     batch_results = []
+                    prog = st.progress(0.0, text="Simulating...") if num_games > 1 else None
 
                     for game_i in range(num_games):
                         gp = st.session_state.games_played
                         if gp >= season_length:
                             break
 
-                        # Game 0 uses manual lineup; subsequent games auto-select
+                        # Game 0 uses manual lineup + load-management rest choices;
+                        # subsequent games auto-select with no manual rest.
                         if game_i == 0:
                             lineup_df = roster[roster['PLAYER'].isin(_cur_starters)]
-                            current_rested = []
+                            current_rested = _effective_rested
                         else:
                             lineup_df, current_rested = auto_select_lineup(
                                 roster, st.session_state.injured_list
@@ -380,15 +432,13 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                         matchups = generate_round_matchups(all_teams, gp)
                         opp_id, _ = find_user_matchup(matchups, current_team_id)
 
-                        score, opp_score, box_score, injury_reports, sub_reports, opp_name, opp_box_score = simulate_game(
+                        final_score, final_opp, box_score, injury_reports, sub_reports, opp_name, opp_box_score = simulate_game(
                             lineup_df, roster, tactic, all_stats, all_teams,
                             current_team_id, current_rested,
                             opponent_team_id=opp_id,
                             difficulty=difficulty,
+                            is_home=(gp % 2 == 0),
                         )
-
-                        final_score = int(score * p_mod)
-                        final_opp = int(opp_score * o_mod)
                         res = "W" if final_score > final_opp else "L"
                         st.session_state.results.append(res)
 
@@ -425,6 +475,10 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                             'opp_name': opp_name,
                             'played_opp_id': opp_id,
                         })
+                        if prog:
+                            prog.progress((game_i + 1) / num_games,
+                                          text=f"Simulating game {gp + 1}... "
+                                               f"({'W' if res == 'W' else 'L'} vs {opp_name})")
 
                     # Store the last game for detailed display and batch summary
                     if batch_results:
@@ -443,7 +497,8 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
 
         st.divider()
         st.subheader("🏀 Pick Your Lineup")
-        st.caption("Check up to 5 players to start. Top 5 scorers are pre-selected.")
+        st.caption("Check up to 5 players to start. Top 5 scorers are pre-selected. "
+                   "🛡️ Defense matters: your starters' combined steals + blocks suppress the opponent's score in sims.")
 
         suggested = healthy_roster.nlargest(5, 'PTS')['PLAYER'].tolist()
         starters = []
@@ -457,23 +512,59 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                 value=row['PLAYER'] in suggested,
                 key=f"starter_{row['PLAYER']}",
             )
+            stocks = float(row.get('STL', 0) or 0) + float(row.get('BLK', 0) or 0)
+            _age = row.get('AGE')
+            age_str = f" · {int(_age)}y" if _age is not None and _age == _age else ""
             col.caption(
-                f"`{pos}` · OVR {overall_badge(int(row['OVERALL']))}  \n"
-                f"{row['PTS']:.1f} PPG · {fmt_salary(row['SALARY'])}"
+                f"`{pos}`{age_str} · OVR {overall_badge(int(row['OVERALL']))}  \n"
+                f"{row['PTS']:.1f} PPG · 🛡️ {stocks:.1f} · {fmt_salary(row['SALARY'])}"
             )
             if selected:
                 starters.append(row['PLAYER'])
 
         n = len(starters)
         if n > 0:
-            starter_sal = roster[roster['PLAYER'].isin(starters)]['SALARY'].sum()
+            starter_df = roster[roster['PLAYER'].isin(starters)]
+            starter_sal = starter_df['SALARY'].sum()
             status = f"{n}/5 selected · {fmt_salary(starter_sal)}"
-            if n == 5 and starter_sal > SALARY_CAP:
+            if n == 5:
+                d_factor = lineup_defense_factor(starter_df)
+                d_label = ("🔒 Elite D" if d_factor <= 0.96 else
+                           "🛡️ Solid D" if d_factor <= 1.0 else "🚪 Leaky D")
+                status += f" · {d_label} (opp scoring {(d_factor - 1) * 100:+.0f}%)"
+            if n == 5 and starter_sal > salary_cap_for_season(st.session_state.get('season_number', 1)):
                 st.warning(f"⚠️ Cap Violation — {status}")
             elif n == 5:
                 st.success(f"✅ Lineup locked — {status}")
             else:
                 st.info(f"{status}")
+
+        # ── Load Management (Hard mode) ───────────────────────────────────────
+        if hard and season_phase == 'regular' and games_played < season_length:
+            season_stam = st.session_state.get('season_stamina', {})
+            bench_healthy = [p for p in healthy_roster['PLAYER'].tolist() if p not in starters]
+
+            # Heads-up if a starter is running on fumes
+            tired = sorted(((p, int(season_stam.get(p, 100))) for p in starters),
+                           key=lambda x: x[1])
+            with st.expander("💤 Load Management — rest tired players", expanded=bool(tired and tired[0][1] < 55)):
+                st.caption(
+                    "Rested players sit out the next game entirely and recover to 100% stamina — "
+                    "use it to keep stars fresh over a long season, but you'll be short-handed. "
+                    "To rest a starter, uncheck them above first."
+                )
+                if tired and tired[0][1] < 55:
+                    st.warning(f"⚠️ **{tired[0][0]}** is gassed at {tired[0][1]}% — heavy-minute "
+                               f"players are injury risks when fatigued.")
+                if bench_healthy:
+                    st.multiselect(
+                        "Rest these players next game:",
+                        options=bench_healthy,
+                        key="rest_players",
+                        format_func=lambda p: f"{p} — {int(season_stam.get(p, 100))}% stamina",
+                    )
+                else:
+                    st.caption("No rest-eligible (non-starting, healthy) players.")
 
         # ── Last game result (rendered from session state after rerun) ─────────
         if st.session_state.get('show_balloons'):
@@ -486,6 +577,10 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
             batch_w = sum(1 for g in batch if g['res'] == 'W')
             batch_l = len(batch) - batch_w
             st.subheader(f"Batch Results: {batch_w}W — {batch_l}L in {len(batch)} games")
+            batch_injuries = [ir for g in batch for ir in g['injury_reports']]
+            if batch_injuries:
+                st.warning("🚑 **Injuries during the stretch:**\n\n"
+                           + "\n".join(f"- {ir}" for ir in batch_injuries))
             with st.expander("Game-by-game scores"):
                 for i, g in enumerate(batch):
                     icon = "✅" if g['res'] == 'W' else "❌"
@@ -496,6 +591,9 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
 
         r = st.session_state.get('last_game_result')
         if r:
+            headline, potg = _game_headline(r, my_team['full_name'])
+            if headline:
+                st.info(headline)
             sc_my, sc_vs, sc_opp = st.columns([3, 1, 3])
             with sc_my:
                 lc, mc = st.columns([1, 2])
@@ -512,19 +610,28 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                     lc.image(team_logo_url(r['played_opp_id']), width=70)
                 mc.metric(r['opp_name'], r['final_opp'])
 
+            if potg:
+                st.markdown(potg)
+
             for ir in r['injury_reports']:
                 st.warning(f"🚑 {ir}")
 
             st.subheader("Box Score")
             bs_tab_my, bs_tab_opp, bs_tab_flow = st.tabs([f"🏠 {my_team['abbreviation']}", f"🏀 {r['opp_name']}", "📈 Game Flow"])
 
+            def _fmt_pm(pm):
+                if pm is None:
+                    return "—"
+                return f"+{pm}" if pm > 0 else str(pm)  # nba.com style: "+7", "-3", "0"
+
             def _render_box_score_table(box_rows):
-                hdr = st.columns([1, 3, 1, 1, 1, 1, 1, 1, 2])
-                for col, label in zip(hdr, ["", "Player", "PTS", "REB", "AST", "STL", "BLK", "TOV", "Stamina"]):
+                widths = [1, 3, 1, 1, 1, 1, 1, 1, 1, 2]
+                hdr = st.columns(widths)
+                for col, label in zip(hdr, ["", "Player", "PTS", "REB", "AST", "STL", "BLK", "TOV", "+/-", "Stamina"]):
                     col.write(f"**{label}**")
                 st.divider()
                 for p in box_rows:
-                    rc = st.columns([1, 3, 1, 1, 1, 1, 1, 1, 2])
+                    rc = st.columns(widths)
                     pid = int(p['PLAYER_ID'])
                     if pid == 0:
                         rc[0].write("🪑")
@@ -537,9 +644,10 @@ def render(my_team, current_team_id, roster, all_teams, all_stats,
                     rc[5].write(str(p.get('STL', 0)))
                     rc[6].write(str(p.get('BLK', 0)))
                     rc[7].write(str(p.get('TOV', 0)))
+                    rc[8].write(_fmt_pm(p.get('PM')))
                     stam = p['Stamina Left']
                     icon = "🟢" if stam >= 60 else "🟡" if stam >= 30 else "🔴"
-                    rc[8].write(f"{icon} {stam}%")
+                    rc[9].write(f"{icon} {stam}%")
 
             with bs_tab_my:
                 _render_box_score_table(r['box_score'])

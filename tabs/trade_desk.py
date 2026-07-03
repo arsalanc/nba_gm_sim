@@ -1,14 +1,41 @@
 import streamlit as st
 
-from utils import team_logo_url, fmt_salary, evaluate_trade, save_state
+from utils import team_logo_url, fmt_salary, evaluate_trade, save_state, luxury_tax_for_season
 
 
-def render(my_team, current_team_id, roster, all_teams, all_stats, acquired, difficulty, hard):
+def render(my_team, current_team_id, roster, all_teams, all_stats, acquired, difficulty, hard,
+           games_played=0, season_phase='regular', season_length=82):
     st.subheader("Trade Desk")
+
+    # Trade deadline: ~75% through the regular season, like the real NBA.
+    # No trades during the playoffs — build your contender before the deadline.
+    deadline_game = int(season_length * 0.75)
+    if season_phase != 'regular' or games_played >= deadline_game:
+        if season_phase == 'regular':
+            st.error(f"🔒 **The trade deadline has passed** (game {deadline_game} of {season_length}). "
+                     "The roster you have is the roster you'll ride into the playoffs.")
+        else:
+            st.error("🔒 **Rosters are locked for the playoffs.** No trades until next season.")
+        if st.session_state.trade_history:
+            with st.expander("Trade History"):
+                for trade in st.session_state.trade_history[:10]:
+                    st.write(f"• {trade}")
+        return
+
+    # Luxury-tax apron: teams over the tax line face tighter salary matching
+    over_tax = roster['SALARY'].sum() > luxury_tax_for_season(st.session_state.get('season_number', 1))
+    match_factor = 1.10 if over_tax else 1.25
+
+    games_left = deadline_game - games_played
     st.caption(
-        "Real NBA salary matching rules apply: incoming salary must be ≤ outgoing × 1.25 + $100K. "
-        "The AI GM will reject lopsided deals."
+        f"⏳ **Trade deadline: game {deadline_game}** — {games_left} game{'s' if games_left != 1 else ''} left to deal. "
+        f"Salary matching: incoming ≤ outgoing × {match_factor} + $100K. "
+        "AI GMs value **stars over volume** — one 90 OVR is worth roughly three 75 OVRs, "
+        "so you can't package role players for a superstar."
     )
+    if over_tax:
+        st.warning("🚨 **You're over the luxury tax — apron rules apply.** Salary matching is "
+                   "tightened from 125% to 110% of outgoing salary. Shed payroll to regain flexibility.")
 
     other_teams_list = [t for t in all_teams if t['id'] != current_team_id]
     team_name_map = {t['full_name']: t for t in other_teams_list}
@@ -56,19 +83,25 @@ def render(my_team, current_team_id, roster, all_teams, all_stats, acquired, dif
             my_trade_df = roster[roster['PLAYER'].isin(my_names)]
             their_trade_df = partner_roster[partner_roster['PLAYER'].isin(their_names)]
 
-            accepted, my_pts, their_pts, my_sal, their_sal = evaluate_trade(my_trade_df, their_trade_df, difficulty)
+            accepted, my_val, their_val, my_sal, their_sal = evaluate_trade(
+                my_trade_df, their_trade_df, difficulty, match_factor=match_factor)
 
-            salary_limit = my_sal * 1.25 + 100_000
+            salary_limit = my_sal * match_factor + 100_000
             st.write(
-                f"**Trade summary:** You send {fmt_salary(my_sal)} / {my_pts:.1f} PPG "
-                f"→ Receive {fmt_salary(their_sal)} / {their_pts:.1f} PPG"
+                f"**Trade summary:** You send {fmt_salary(my_sal)} / value {my_val:.0f} "
+                f"→ Receive {fmt_salary(their_sal)} / value {their_val:.0f}"
             )
+            if their_val > 0:
+                st.progress(min(my_val / max(their_val, 1), 1.0),
+                            text=f"Your offer covers {min(my_val / max(their_val, 1) * 100, 100):.0f}% "
+                                 f"of their asking value")
             if their_sal > salary_limit:
                 st.error(f"Salary mismatch: max you can receive is {fmt_salary(salary_limit)}")
             elif not accepted:
                 st.error(
-                    f"{partner_name}'s GM doesn't see enough value. "
-                    f"They're giving up {their_pts:.1f} PPG for your {my_pts:.1f} PPG — offer more."
+                    f"{partner_name}'s GM doesn't see enough value "
+                    f"(their {their_val:.0f} vs your {my_val:.0f}). "
+                    f"Stars carry a premium — sweeten the offer."
                 )
             else:
                 st.success("✅ AI GM will accept this trade.")

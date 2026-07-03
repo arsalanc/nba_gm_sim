@@ -12,10 +12,23 @@ SAVE_FILE = os.path.join(tempfile.gettempdir(), "gm_save.json")
 
 SALARY_CAP = 140_700_000
 LUXURY_TAX = 170_814_000
+CAP_GROWTH = 1.08  # per-season cap growth (Franchise Mode), mirroring real NBA rises
+
+
+def salary_cap_for_season(season_number=1):
+    return int(SALARY_CAP * CAP_GROWTH ** (max(season_number, 1) - 1))
+
+
+def luxury_tax_for_season(season_number=1):
+    return int(LUXURY_TAX * CAP_GROWTH ** (max(season_number, 1) - 1))
 
 
 # --- URL HELPERS ---
 def player_img_url(player_id):
+    # Generated draft prospects have synthetic IDs with no NBA headshot —
+    # show a generic rookie avatar instead of a broken image.
+    if player_id >= 90_000_000:
+        return "https://ui-avatars.com/api/?name=R&background=17408B&color=ffffff&size=190&bold=true"
     return f"https://cdn.nba.com/headshots/nba/latest/260x190/{player_id}.png"
 
 def team_logo_url(team_id):
@@ -70,6 +83,83 @@ def get_win_probability(strength_a, strength_b):
     return 1 / (1 + 10 ** (-diff / 15))
 
 
+# --- TACTICS ---
+# Tactics trade pace for variance rather than offering a free stat boost:
+#   Pace & Space — more possessions, higher scores, *steadier* outcomes. The
+#                  favorite's pick: over more possessions, talent wins out.
+#   Grit & Grind — slow, physical, low-scoring with *wild* swings. The
+#                  underdog's pick: shorten the game and anything can happen.
+# 'own'/'opp' scale quick-sim totals, 'spread' is the per-player performance
+# range (±), 'drain' is quick-sim stamina cost, 'live_possessions' is
+# per-team possessions per quarter in live games.
+TACTICS = {
+    'Balanced': dict(
+        own=1.00, opp=1.00, spread=0.20, drain=15,
+        live_possessions=24, three_boost=1.0,
+        blurb="Normal pace, no modifiers — let the rosters decide.",
+    ),
+    'Pace & Space': dict(
+        own=1.10, opp=1.10, spread=0.13, drain=19,
+        live_possessions=27, three_boost=1.3,
+        blurb="Up-tempo: higher scores, steadier outcomes — the favorite's pick. "
+              "Drains stamina faster.",
+    ),
+    'Grit & Grind': dict(
+        own=0.85, opp=0.85, spread=0.30, drain=17,
+        live_possessions=20, three_boost=0.85,
+        blurb="Slow it down: low-scoring rock fights with wild swings — the underdog's pick.",
+    ),
+}
+
+
+def apply_roster_overrides(all_stats, overrides):
+    """Return a copy of all_stats with traded players moved to their new teams.
+    Ensures trades affect opponent rosters, scouting, and league sims — not just
+    the user's own roster view."""
+    if not overrides:
+        return all_stats
+    df = all_stats.copy()
+    for name, tid in overrides.items():
+        df.loc[df['PLAYER'] == name, 'TEAM_ID'] = int(tid)
+    return df
+
+
+def win_streak(results):
+    """Length of the current trailing win streak."""
+    streak = 0
+    for r in reversed(results):
+        if r != 'W':
+            break
+        streak += 1
+    return streak
+
+
+def momentum_boost(results):
+    """1.00–1.05 scoring multiplier: teams on a 3+ game win streak play with
+    confidence (+1% per streak game, capped at +5%)."""
+    s = win_streak(results)
+    return 1.0 + min(s, 5) * 0.01 if s >= 3 else 1.0
+
+
+# Home court is worth roughly ±2% in the NBA. None = neutral (no modifier).
+def home_court_factor(is_home):
+    if is_home is True:
+        return 1.02
+    if is_home is False:
+        return 0.98
+    return 1.0
+
+
+def lineup_defense_factor(lineup_df):
+    """Multiplier applied to opponent quick-sim score based on the starters'
+    combined steals + blocks. ~7 stocks is league-average for a starting five;
+    an elite defensive five suppresses opponent scoring by up to ~10%."""
+    if 'STL' not in lineup_df.columns or 'BLK' not in lineup_df.columns or lineup_df.empty:
+        return 1.0
+    stocks = float(lineup_df['STL'].sum() + lineup_df['BLK'].sum())
+    return max(0.90, min(1.08, 1.0 - (stocks - 7.0) * 0.015))
+
+
 # --- STAMINA HELPERS ---
 def stamina_drain_per_quarter(player_min, tactic='Balanced'):
     """Stamina drain for one quarter based on real MPG.
@@ -78,9 +168,9 @@ def stamina_drain_per_quarter(player_min, tactic='Balanced'):
     base_drain = 1200 / clamped_min
     base_drain = max(15, min(100, base_drain))
     if tactic == 'Grit & Grind':
-        base_drain *= 1.3
+        base_drain *= 1.15   # physical, but the slow pace limits total wear
     elif tactic == 'Pace & Space':
-        base_drain *= 1.1
+        base_drain *= 1.25   # running costs legs
     return base_drain
 
 
@@ -158,9 +248,19 @@ def load_nba_data():
             df['POSITION'] = df['PLAYER_ID'].map(pos_map)
             # replace empty strings as well as NaN
             df['POSITION'] = df['POSITION'].replace('', None).fillna('?')
+
+            # Age estimate for Franchise Mode aging: ~21 at draft/debut year.
+            # (2026 = current 2025-26 season; rough is fine for a growth curve.)
+            draft_yr = pd.to_numeric(pi_df.get('DRAFT_YEAR'), errors='coerce')
+            from_yr = pd.to_numeric(pi_df.get('FROM_YEAR'), errors='coerce')
+            start_yr = draft_yr.fillna(from_yr)
+            age_est = (2026 - start_yr + 21).clip(19, 44)
+            age_map = dict(zip(pi_df['PERSON_ID'].astype(int), age_est))
+            df['AGE'] = df['PLAYER_ID'].map(age_map).fillna(27).astype(int)
         except Exception as e:
             st.warning(f"⚠️ Could not load player positions: {e}")
             df['POSITION'] = '?'
+            df['AGE'] = 27
 
         # Overall rating: NBA efficiency formula normalised to 60-99
         eff_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'FGA', 'FGM', 'FTA', 'FTM', 'TOV']
@@ -184,17 +284,27 @@ def load_nba_data():
 
 
 # --- TRADE EVALUATION ---
-def evaluate_trade(my_players_df, their_players_df, difficulty='Easy'):
-    """Return (accepted, my_pts, their_pts, my_sal, their_sal)."""
-    my_pts = my_players_df['PTS'].sum()
-    their_pts = their_players_df['PTS'].sum()
+def trade_value(players_df):
+    """Superlinear trade value from OVERALL — stars are worth far more than
+    the sum of equivalent role players, so you can't package three scrubs
+    for a superstar. OVR 90 ≈ value of three OVR 75 players combined."""
+    if 'OVERALL' in players_df.columns and not players_df.empty:
+        return float(((players_df['OVERALL'] - 55).clip(lower=1) ** 1.7).sum())
+    return float(players_df['PTS'].sum() * 10)  # fallback
+
+
+def evaluate_trade(my_players_df, their_players_df, difficulty='Easy', match_factor=1.25):
+    """Return (accepted, my_value, their_value, my_sal, their_sal).
+    match_factor tightens to 1.10 under luxury-tax apron rules."""
+    my_val = trade_value(my_players_df)
+    their_val = trade_value(their_players_df)
     my_sal = my_players_df['SALARY'].sum()
     their_sal = their_players_df['SALARY'].sum()
 
-    # NBA salary matching: incoming ≤ outgoing * 1.25 + $100K
-    salary_ok = their_sal <= my_sal * 1.25 + 100_000
-    # AI GM threshold — Hard: won't give up more than 5% better PPG; Easy: 15%
-    threshold = 1.05 if difficulty == 'Hard' else 1.15
-    value_ok = their_pts <= my_pts * threshold
+    # NBA salary matching: incoming ≤ outgoing * match_factor + $100K
+    salary_ok = their_sal <= my_sal * match_factor + 100_000
+    # AI GM threshold — Hard: demands near-even value; Easy: accepts a 10% haircut
+    threshold = 1.02 if difficulty == 'Hard' else 1.10
+    value_ok = their_val <= my_val * threshold
 
-    return salary_ok and value_ok, my_pts, their_pts, my_sal, their_sal
+    return salary_ok and value_ok, my_val, their_val, my_sal, their_sal

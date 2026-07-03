@@ -1,7 +1,7 @@
 import streamlit as st
 import plotly.graph_objects as go
 
-from utils import player_img_url, team_logo_url, overall_badge, compute_team_strength
+from utils import player_img_url, team_logo_url, overall_badge, compute_team_strength, lineup_defense_factor
 from engine import generate_round_matchups, find_user_matchup
 
 
@@ -85,6 +85,10 @@ def render(my_team, current_team_id, roster, all_teams, all_stats, season_phase,
                 nc.subheader(opp_team_info['full_name'])
                 nc.caption(f"OVR {opp_avg_ovr}")
 
+            if season_phase == 'regular' and games_played < season_length:
+                _is_home = games_played % 2 == 0
+                st.caption(f"{'🏠 Home game — crowd behind you (+2% scoring)' if _is_home else '✈️ Road game — hostile arena (-2% scoring)'}")
+
             # Team strength bar
             st.caption("Team strength — avg OVERALL of top 5")
             my_share = my_avg_ovr / (my_avg_ovr + opp_avg_ovr)
@@ -129,12 +133,14 @@ def render(my_team, current_team_id, roster, all_teams, all_stats, season_phase,
             if opp_avg_ovr > my_avg_ovr + 5:
                 advice_lines.append(
                     f"⚠️ **Tough matchup.** {opp_team_info['full_name']} is significantly stronger "
-                    f"({opp_avg_ovr} vs your {my_avg_ovr}). Consider **Grit & Grind** to slow the game down."
+                    f"({opp_avg_ovr} vs your {my_avg_ovr}). **Grit & Grind** is the underdog's playbook: "
+                    f"slow it down, shorten the game, and let variance work for you."
                 )
             elif my_avg_ovr > opp_avg_ovr + 5:
                 advice_lines.append(
                     f"✅ **Favorable matchup.** You're the stronger team ({my_avg_ovr} vs {opp_avg_ovr}). "
-                    f"**Pace & Space** could blow this one open."
+                    f"Push the pace with **Pace & Space** — over more possessions, your talent wins out. "
+                    f"Don't let them turn it into a coin-flip rock fight."
                 )
             else:
                 advice_lines.append(
@@ -147,6 +153,19 @@ def render(my_team, current_team_id, roster, all_teams, all_stats, season_phase,
                 f"({opp_top_scorer['PTS']:.1f} PPG, OVR {overall_badge(int(opp_top_scorer['OVERALL']))}) "
                 f"— their primary scorer."
             )
+
+            d_factor = lineup_defense_factor(my_lineup_df)
+            if d_factor <= 0.96:
+                advice_lines.append(
+                    f"🔒 Your projected five is an **elite defensive unit** "
+                    f"(opponent scoring {(d_factor - 1) * 100:+.0f}% in sims)."
+                )
+            elif d_factor > 1.0:
+                advice_lines.append(
+                    f"🚪 Your projected five is **light on defense** "
+                    f"(opponent scoring {(d_factor - 1) * 100:+.0f}% in sims). "
+                    f"A rim protector or ball-hawk in the lineup would help."
+                )
 
             for line in advice_lines:
                 st.markdown(line)
